@@ -100,16 +100,16 @@ if (Test-Path (Join-Path $carpeta 'camvoice-cli.exe')) {
 }
 Remove-Item $temporal -Recurse -Force
 
-$instalar = Join-Path $carpeta 'instalacion\INSTALAR.bat'
-if (-not (Test-Path $instalar)) { Fallo "El paquete no contiene instalacion\INSTALAR.bat." }
+$rutaInstalar = Join-Path $carpeta 'instalacion\INSTALAR.bat'
+if (-not (Test-Path $rutaInstalar)) { Fallo "El paquete no contiene instalacion\INSTALAR.bat." }
 
 Write-Host ''
 if ($Instalar) {
-    & $instalar
+    & $rutaInstalar
     exit $LASTEXITCODE
 }
 Write-Host 'Siguiente paso (sin administrador):'
-Write-Host "    `"$instalar`""
+Write-Host "    `"$rutaInstalar`""
 Write-Host 'Despues abre:'
 Write-Host "    `"$(Join-Path $carpeta 'camvoice.exe')`""
 exit 0
