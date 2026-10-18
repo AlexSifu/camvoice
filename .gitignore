@@ -1,0 +1,33 @@
+# Entorno de desarrollo
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Artefactos de compilación. El ejecutable NO se versiona: son 227 MB y es
+# contenido derivado. Se genera con `pyinstaller build/camvoice.spec` o se
+# descarga de la pestaña Releases. Ver docs/INSTALACION.md.
+dist/
+build/work/
+# Carpeta de trabajo que PyInstaller deja junto al .spec
+build/camvoice/
+*.spec.bak
+# Descargas del lanzador (scripts/obtener-portable.ps1)
+descargas/
+*.zip
+*.zip.sha256
+
+# Notas de trabajo locales, no forman parte del proyecto
+notas_ia/
+
+# Material de prueba generado
+clips/
+instalacion/diagnostico-*.txt
+
+# Caché de fotogramas, por si alguien apunta CAMVOICE_HOME al repo
+*.raw
+*.raw.tmp
+
+# NOTA: vendor/filters/*.dll SÍ se versiona a propósito.
+# Son el filtro de cámara virtual (MIT, 326 KB en total) y sin ellas la
+# aplicación no puede registrarse como cámara. Ver vendor/filters/ATRIBUCION.md

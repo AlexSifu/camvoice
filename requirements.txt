@@ -1,0 +1,18 @@
+# Dependencias de ejecución. Todas tienen rueda precompilada para Windows x64:
+# no se necesita compilador ni Visual C++ Build Tools.
+#
+# Dos elecciones no son las obvias y están fijadas a propósito; ver
+# docs/ARQUITECTURA.md y plan.md §3 para el razonamiento completo:
+#
+#   webrtcvad-wheels        en lugar de `webrtcvad`, que NO publica rueda para
+#                           Windows y exige compilar con Visual C++.
+#   opencv-python-headless  en lugar de `opencv-python`, que incluye sus propios
+#                           plugins de Qt y choca con PySide6 al arrancar.
+
+numpy>=1.26,<3
+opencv-python-headless==4.10.0.84
+sounddevice==0.5.1
+webrtcvad-wheels==2.0.14
+pyvirtualcam==0.15.0
+PySide6-Essentials==6.8.1.1
+psutil>=5.9

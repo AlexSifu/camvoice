@@ -1,0 +1,76 @@
+# Pruebas + version portable en un runner Windows.
+#
+# - Cada push a main y cada pull request: pruebas, compilacion y el ZIP como
+#   artefacto descargable de la ejecucion (caduca a los 30 dias).
+# - Cada etiqueta v* (p. ej. v0.1.0): ademas publica un GitHub Release con
+#   camvoice-win64.zip y camvoice-win64.zip.sha256, que es lo que descarga
+#   OBTENER-CAMVOICE.bat.
+#
+# No usa secretos propios: solo el GITHUB_TOKEN de la ejecucion, con permiso de
+# escritura unicamente en el trabajo que crea el Release.
+
+name: build
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Dependencias (versiones fijadas)
+        run: python -m pip install -r requirements-lock.txt
+
+      - name: Pruebas, compilacion y ZIP
+        shell: pwsh
+        run: ./scripts/build-portable.ps1 -Python python
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: camvoice-win64
+          path: |
+            dist/camvoice-win64.zip
+            dist/camvoice-win64.zip.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: camvoice-win64
+          path: dist
+
+      - name: Comprobar el SHA-256 antes de publicar
+        working-directory: dist
+        run: sha256sum -c camvoice-win64.zip.sha256
+
+      - name: Publicar el Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            dist/camvoice-win64.zip dist/camvoice-win64.zip.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "camvoice $TAG" \
+            --notes "Version portable para Windows 10/11 x64. No necesita Python ni administrador. Descomprime y ejecuta instalacion\\INSTALAR.bat, o usa OBTENER-CAMVOICE.bat desde un clon del repositorio (descarga y verifica el SHA-256). Ver docs/VALIDACION_PC_NUEVA.md."

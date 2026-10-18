@@ -1,0 +1,18 @@
+# Normalización de fin de línea.
+* text=auto eol=lf
+
+# Scripts de Windows: CRLF obligatorio.
+# Los .bat con LF fallan en cmd.exe, y los .ps1 se leen mejor con CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf working-tree-encoding=UTF-8
+
+# Binarios: nunca tocar.
+*.dll binary
+*.exe binary
+*.pyd binary
+*.mp4 binary
+*.raw binary
+
+# No contar la documentación en las estadísticas de lenguaje del repositorio.
+docs/* linguist-documentation
