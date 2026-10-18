@@ -76,8 +76,10 @@ if ($faltan) { Fallo ("Faltan en dist\camvoice: " + ($faltan -join ', ')) }
 Ok 'Contenido del paquete completo'
 
 # 3. Arranque del ejecutable (solo lectura: no registra nada) ------------------
+# 'cameras' sale con 1 si el equipo no tiene ninguna camara (un runner de CI);
+# eso es un resultado valido. Un fallo de arranque del ejecutable da otro codigo.
 & (Join-Path $app 'camvoice-cli.exe') cameras | Out-Host
-if ($LASTEXITCODE -ne 0) { Fallo 'camvoice-cli.exe cameras no arranca.' }
+if ($LASTEXITCODE -notin 0, 1) { Fallo "camvoice-cli.exe cameras no arranca (codigo $LASTEXITCODE)." }
 Ok 'camvoice-cli.exe arranca'
 
 # 4. ZIP y SHA-256 -------------------------------------------------------------

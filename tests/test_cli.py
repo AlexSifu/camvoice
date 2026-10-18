@@ -157,10 +157,9 @@ def test_run_con_duracion_cero_de_clips_sinteticos(tiny_clips, tmp_path):
 
 
 def test_cameras_enumera_el_registro():
-    """En Windows siempre hay al menos una entrada si hay cualquier cámara."""
+    """Con o sin cámaras (un runner de CI no tiene ninguna) la salida es legible."""
     result = run_cli("cameras")
     assert result.returncode in (0, 1)
-    assert "C" in result.stdout  # produjo salida legible
     assert "Backends utilizables" in result.stdout or "No se pudo enumerar" in result.stdout
 
 
@@ -176,7 +175,8 @@ def test_la_salida_redirigida_va_en_utf8():
         capture_output=True, timeout=120,
     )
     texto = raw.stdout.decode("utf-8", errors="strict")
-    assert "disponibles" in texto
+    # Sin micrófono (runner de CI) el mensaje cambia, pero también lleva acentos.
+    assert "disponibles" in texto or "ningún dispositivo" in texto
 
 
 def test_el_punto_de_entrada_fuerza_utf8():
