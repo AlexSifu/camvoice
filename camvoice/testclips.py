@@ -16,7 +16,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-__all__ = ["make_test_clips", "render_face"]
+__all__ = ["make_test_clips", "make_test_library", "render_face"]
 
 _SKIN = (150, 185, 215)
 _BG_TOP = (70, 55, 45)
@@ -148,3 +148,101 @@ def make_test_clips(
         outdir / "silencio-prueba.mp4", width, height, fps, frames, lambda t: 0.0, "SILENCIO"
     )
     return speaking_path, silent_path
+
+
+# --------------------------------------------------------------------------- #
+# Biblioteca de prueba: segundo silencio desplazado y gestos
+# --------------------------------------------------------------------------- #
+
+
+def _write_custom(path: Path, width: int, height: int, fps: int, frames: int, frame_fn) -> Path:
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    writer = cv2.VideoWriter(str(path), fourcc, float(fps), (width, height))
+    if not writer.isOpened():
+        raise RuntimeError(f"OpenCV no pudo crear {path.name}. Prueba otra carpeta de salida.")
+    try:
+        for i in range(frames):
+            writer.write(frame_fn(i, i / fps))
+    finally:
+        writer.release()
+    return path
+
+
+def _shifted(frame: np.ndarray, dx: float, dy: float, gain: float = 1.0) -> np.ndarray:
+    h, w = frame.shape[:2]
+    if dx or dy:
+        m = np.float32([[1, 0, dx], [0, 1, dy]])
+        frame = cv2.warpAffine(frame, m, (w, h), borderMode=cv2.BORDER_REPLICATE)
+    if gain != 1.0:
+        frame = np.clip(frame.astype(np.float32) * gain, 0, 255).astype(np.uint8)
+    return frame
+
+
+_GESTURE_MOTION = {
+    # nombre: (dx(p), dy(p), boca(p)) con p en 0..1; todos vuelven a (0, 0, 0)
+    "saludar": (lambda p: 0.0, lambda p: -0.02 * math.sin(math.pi * p), lambda p: 0.25 * math.sin(math.pi * p)),
+    "sonreir": (lambda p: 0.0, lambda p: 0.0, lambda p: 0.18 * math.sin(math.pi * p)),
+    "asentir": (lambda p: 0.0, lambda p: 0.03 * math.sin(2 * math.pi * p), lambda p: 0.0),
+    "negar": (lambda p: 0.03 * math.sin(2 * math.pi * p), lambda p: 0.0, lambda p: 0.0),
+    "mirar_arriba": (lambda p: 0.0, lambda p: -0.05 * math.sin(math.pi * p), lambda p: 0.0),
+    "mirar_izquierda": (lambda p: -0.05 * math.sin(math.pi * p), lambda p: 0.0, lambda p: 0.0),
+    "mirar_derecha": (lambda p: 0.05 * math.sin(math.pi * p), lambda p: 0.0, lambda p: 0.0),
+}
+
+
+def make_test_library(
+    outdir: Path,
+    *,
+    width: int = 640,
+    height: int = 480,
+    fps: int = 30,
+    seconds: float = 6.0,
+    gestures: tuple[str, ...] = ("saludar", "sonreir", "asentir", "mirar_arriba"),
+) -> dict:
+    """Clips de prueba para el modo director y un manifiesto que los enlaza.
+
+    Escribe además de los dos clips básicos un segundo silencio con el encuadre
+    desplazado 3 % y un 12 % más claro (para probar la normalización) y un clip
+    por gesto que empieza y termina en la pose neutra. Devuelve un dict con las
+    rutas y `manifest`, la ruta del manifiesto escrito en `outdir`.
+    """
+    import json
+
+    outdir = Path(outdir)
+    speaking, silent = make_test_clips(outdir, width=width, height=height, fps=fps, seconds=seconds)
+    frames = max(2, int(round(seconds * fps)))
+    silent2 = _write_custom(
+        outdir / "silencio-2-prueba.mp4", width, height, fps, frames,
+        lambda i, t: _shifted(
+            render_face(width, height, t + 2.1, mouth_open=0.0, label="SILENCIO 2"),
+            0.03 * width, 0.02 * height, 1.12,
+        ),
+    )
+    gesture_paths = {}
+    g_frames = max(4, int(round(1.6 * fps)))
+    for name in gestures:
+        fx, fy, fm = _GESTURE_MOTION[name]
+
+        def frame_fn(i, t, fx=fx, fy=fy, fm=fm, name=name):  # noqa: ANN001, ANN202
+            p = i / (g_frames - 1)
+            face = render_face(width, height, t, mouth_open=fm(p), label=name.upper())
+            return _shifted(face, fx(p) * width, fy(p) * height)
+
+        gesture_paths[name] = _write_custom(
+            outdir / f"gesto-{name}.mp4", width, height, fps, g_frames, frame_fn
+        )
+    manifest = {
+        "version": 1,
+        "silent": [str(silent2)],
+        "speaking": [],
+        "gestures": {n: {"clip": str(p), "enabled": True} for n, p in gesture_paths.items()},
+    }
+    manifest_path = outdir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8")
+    return {
+        "speaking": speaking,
+        "silent": silent,
+        "silent2": silent2,
+        "gestures": gesture_paths,
+        "manifest": manifest_path,
+    }

@@ -91,6 +91,84 @@ El guion completo —qué decir, qué no hacer, por qué el clip de silencio se
 reproduce la mitad del tiempo hacia atrás— está en
 [docs/GUION-GRABACION.md](docs/GUION-GRABACION.md).
 
+## Reuniones largas y gestos (modo director)
+
+Por defecto la reproducción usa el **modo director**
+([docs/DISENO_CAMVOICE_TIEMPO_REAL.md](docs/DISENO_CAMVOICE_TIEMPO_REAL.md)):
+
+- **Reproducción continua**: cada clip avanza fotograma a fotograma, sin
+  saltos dentro del clip. Los cambios (hablar/callar, renovar segmento, gesto)
+  esperan a un fotograma «ancla» (boca cerrada, pose neutra) hasta 180 ms; si
+  no llega, o el clip tiene pocas anclas, se hace un fundido corto de
+  150-200 ms.
+- **Micro-pausas**: un silencio de 150-250 ms dentro de una frase lleva al
+  grupo de silencio por un ancla. No es sincronía labial: la boca no sigue
+  las palabras.
+- **Varios clips** de silencio y de habla (pestaña Videos → biblioteca) para
+  que en 1-2 horas no se reconozca un bucle; se alinean en encuadre y color
+  con el silencio principal.
+- **Gestos** (saludar, sonreír, asentir…): `Ctrl+Alt+F1…F8`, cancelar con
+  `Ctrl+Alt+F12`, botones de la pestaña Gestos o menú de la bandeja. Si pides
+  un gesto mientras hablas se usa su variante `<gesto>_hablando` si la hay; si
+  no, espera como mucho 170 ms a una micro-pausa o a un ancla, entra con un
+  fundido corto y al terminar vuelve al habla. Nunca se rechaza ni se aplaza.
+- **Frases breves automáticas**: si importaste las escenas 6, 7 y 8, el
+  director abre a veces una intervención con «Respuesta corta» o «Frase
+  corta» y usa «Terminar una explicación» como cierre en intervenciones
+  largas. Si sigues hablando enlaza con el bucle de habla; si callas antes,
+  pasa al silencio con un fundido corto. Un gesto pedido la sustituye al
+  instante. Se desactiva con `gestures.auto_speaking_shots: false`.
+- **Rotación**: en silencios largos alterna «Silencio neutro» (1) y «Escucha
+  atenta» (3); en intervenciones largas rota entre «Habla natural» (2) y las
+  variaciones de habla, entrando por anclas distintas, no siempre por el
+  principio.
+- **Pausar video** (`Ctrl+Alt+F11`, pestaña Gestos o bandeja): congela la
+  última imagen emitida (nunca negro, sin ningún signo de pausa en la cámara)
+  y lo indica en la ventana y en la bandeja; al reanudar vuelve con un
+  fundido hacia el ancla más parecida.
+
+La imagen emitida por la cámara virtual es siempre limpia: sin rótulos,
+marcas de agua, bordes ni textos. Los estados (silencio, habla, gesto, pausa)
+y el aviso «VÍDEO PREGRABADO» se muestran solo en la ventana local y en la
+bandeja.
+Cómo grabar el material: [docs/GUIA_GRABACION_Y_GESTOS.md](docs/GUIA_GRABACION_Y_GESTOS.md).
+El modo anterior sigue disponible (`playback: classic`).
+
+## Biblioteca de 62 grabaciones (pestaña Biblioteca)
+
+Si grabaste las 62 escenas numeradas con la app Cámara de Windows (carpeta
+`Imágenes\Camera Roll`, archivos `1.mp4` … `66.mp4`; los números 50, 52, 59 y
+63 se omiten a propósito):
+
+1. Pestaña **Biblioteca** → «Detectar 62 grabaciones». Muestra cuáles están,
+   cuáles faltan y cuántos archivos se ignoran (sin número, `v_aud_*`,
+   subcarpetas, no-video).
+2. «**Validar y preparar vídeos**»: valida cada archivo (abre, lee cadencia,
+   resolución y duración, genera miniatura), importa las escenas a
+   `%APPDATA%\camvoice\library\manifest.json` y prepara cachés e índices.
+   Muestra fase, progreso, tiempo transcurrido y un informe; se puede
+   cancelar y retomar (lo ya validado no se repite). Por defecto **no copia**
+   los videos: los referencia en su carpeta. Todo archivo que se decodifica
+   queda «Listo» y activo de inmediato; los avisos (duración corta, cadencia
+   variable, otra resolución) se muestran en el informe pero no bloquean.
+   Solo un archivo vacío o ilegible queda en «Error».
+3. Tabla con filtros por categoría y estado y búsqueda; al seleccionar una
+   escena se puede reproducir. Con los videos preparados, los botones de
+   **ensayo** reproducen hablar→callar, callar→hablar, gesto→silencio y
+   gesto→habla y muestran el par de fotogramas elegido, la espera hasta el
+   fundido y si se usó el fundido de reserva.
+4. Opciones avanzadas (plegadas): copiar en vez de referenciar, conservar los
+   clips principales, revalidar todo, no preparar cachés y **deshacer la
+   última importación**.
+
+La pestaña Gestos muestra la galería de escenas de acción (miniatura,
+descripción, atajo opcional y «Probar»). Las escenas no traen atajo global:
+no se registran 62 combinaciones, solo las que asignes; se rechazan las
+repetidas. Se marca qué gestos no tienen variante «hablando».
+
+Desde la consola: `camvoice library --import` y después `camvoice index`;
+`camvoice transitions` mide las transiciones con los clips preparados.
+
 ## Segundo plano
 
 Casilla en la pestaña **Salida**: al cerrar la ventana, la aplicación sigue en
@@ -146,6 +224,11 @@ optimizaciones; están en [docs/METRICS.md](docs/METRICS.md) §Medición 3.
 | `camvoice vad-test` | Ajusta la sensibilidad del detector con el micrófono real |
 | `camvoice bench --duration 1800` | Mide CPU, memoria y FPS |
 | `camvoice make-clips` | Genera clips sintéticos de prueba |
+| `camvoice index` | Prepara cachés, normalización e índices del modo director |
+| `camvoice gestures` | Lista y valida los gestos; `--set saludar clip.mp4 --hotkey Ctrl+Alt+F1` asigna uno |
+| `camvoice library` | Detecta y valida las 62 grabaciones numeradas; `--import` las importa, `--rollback` deshace |
+| `camvoice transitions --repeats 20` | Ensaya hablar/callar/gesto con los clips preparados y resume esperas, fundidos y coste de discontinuidad |
+| `camvoice soak --simulate --duration 7200` | Simula 2 h de reunión (voz sintética y gestos) sin micrófono ni cámara |
 | `camvoice clean` | Vacía la caché de fotogramas |
 
 Los subcomandos `run`, `bench` y `gui` aceptan además `--blur`, `--pixelate`, `--brightness`, `--contrast`, `--saturation`, `--vignette`, `--grain`, `--zoom` y `--no-effects`.
@@ -210,7 +293,7 @@ repetirlo en el Core i5 de referencia y durante 30 minutos.
 ## Pruebas
 
 ```bash
-pytest          # 341 pruebas, ~18 s, sin micrófono ni cámara
+pytest          # 601 pruebas (+5 omitidas sin cámara real), ~2,5 min, sin micrófono ni cámara
 ```
 
 Procedimiento completo, incluidas las pruebas manuales, en
@@ -218,9 +301,9 @@ Procedimiento completo, incluidas las pruebas manuales, en
 
 ## Lo que esto NO hace
 
-No sincroniza los labios. El clip de habla se reproduce cuando se detecta voz,
-sin relación con las palabras: habrá desajuste entre el audio y la boca, por
-construcción. El primer fonema nunca está sincronizado. Risas, toses y
+No sincroniza los labios. En modo director los clips de habla avanzan de
+forma continua y solo se pasa a boca cerrada en las micro-pausas (por un
+fotograma ancla), así que la boca no sigue las palabras. El primer fonema nunca está sincronizado. Risas, toses y
 carraspeos activan el estado de habla. **Quien se fije lo notará.**
 
 El objetivo es estabilidad y bajo consumo, no una falsa promesa de
@@ -240,3 +323,6 @@ sincronización. Límites completos en [plan.md](plan.md) §5.
 | [docs/PRUEBAS.md](docs/PRUEBAS.md) | Procedimiento de pruebas |
 | [docs/METRICS.md](docs/METRICS.md) | Mediciones de rendimiento |
 | [docs/LICENCIAS.md](docs/LICENCIAS.md) | Dependencias y licencias |
+| [docs/DISENO_CAMVOICE_TIEMPO_REAL.md](docs/DISENO_CAMVOICE_TIEMPO_REAL.md) | Modo director: estados, boca guiada, gestos, transiciones |
+| [docs/GUIA_GRABACION_Y_GESTOS.md](docs/GUIA_GRABACION_Y_GESTOS.md) | **Material para reuniones largas y gestos, atajos** |
+| [docs/VALIDACION_CAMVOICE.md](docs/VALIDACION_CAMVOICE.md) | Pruebas ejecutadas y resultados medidos |

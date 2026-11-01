@@ -146,7 +146,7 @@ class RecordingPlan:
 
     name: str
     kind: str
-    """'speaking' | 'silent'."""
+    """'speaking' | 'silent' | 'gesture'."""
 
     duration_s: float
     lead_in_s: float
@@ -157,6 +157,15 @@ class RecordingPlan:
 
     reading_text: str = ""
     checklist: tuple[str, ...] = ()
+    script: tuple[tuple[str, str], ...] = ()
+    """Si no está vacío, sustituye al tramo central: (título, detalle) que se
+    reparten a partes iguales entre el arranque y la cola. Lo usan los planes
+    largos (variedad de escucha, temas de conversación) y los gestos."""
+
+    min_duration_s: float = 4.0
+    max_duration_s: float = 60.0
+    gesture: str = ""
+    """Nombre del gesto (solo kind == 'gesture')."""
 
     def cues(self) -> list[Cue]:
         """Señales derivadas de los tiempos. Siempre cubren [0, duration_s)."""
@@ -171,13 +180,37 @@ class RecordingPlan:
             critical=True,
         )
 
+        if self.kind == "gesture":
+            centro = self._script_cues(fin_lead, inicio_cola)
+            cola = Cue(
+                inicio_cola,
+                self.duration_s,
+                "VUELVE a la pose neutra y quédate quieto",
+                "Boca cerrada, mirada al objetivo: igual que al empezar. "
+                "Así el gesto enlaza sin salto con el resto de clips.",
+                critical=True,
+            )
+            return [apertura, *centro, cola]
+
         if self.kind == "speaking":
-            centro = self._reading_cues(fin_lead, inicio_cola)
+            centro = (
+                self._script_cues(fin_lead, inicio_cola) if self.script
+                else self._reading_cues(fin_lead, inicio_cola)
+            )
             cola = Cue(
                 inicio_cola,
                 self.duration_s,
                 "Termina la frase y CIERRA LA BOCA",
                 "No hace falta acabar el texto. Lo que importa es cerrar.",
+                critical=True,
+            )
+        elif self.script:
+            centro = self._script_cues(fin_lead, inicio_cola)
+            cola = Cue(
+                inicio_cola,
+                self.duration_s,
+                "Vuelve a la pose del principio",
+                "Boca cerrada, mirada al objetivo, quieto pero vivo.",
                 critical=True,
             )
         else:
@@ -244,6 +277,18 @@ class RecordingPlan:
             t = t_fin
         return cues
 
+    def _script_cues(self, inicio: float, fin: float) -> list[Cue]:
+        """Reparte el guion por igual en [inicio, fin)."""
+        pasos = self.script or (("Sigue", ""),)
+        ventana = max(0.0, fin - inicio)
+        paso = ventana / len(pasos)
+        cues = []
+        for i, (titulo, detalle) in enumerate(pasos):
+            t0 = inicio + i * paso
+            t1 = fin if i == len(pasos) - 1 else t0 + paso
+            cues.append(Cue(t0, t1, titulo, detalle, critical=self.kind == "gesture"))
+        return cues
+
     def reading_phrases(self) -> list[str]:
         """Frases del texto de lectura, en el orden en que se mostrarán."""
         return [
@@ -269,9 +314,9 @@ class RecordingPlan:
 
     def with_duration(self, duration_s: float) -> RecordingPlan:
         """Mismo guion con otra duración, reajustando el texto de lectura."""
-        duration_s = max(4.0, min(60.0, float(duration_s)))
+        duration_s = max(self.min_duration_s, min(self.max_duration_s, float(duration_s)))
         texto = self.reading_text
-        if self.kind == "speaking":
+        if self.kind == "speaking" and not self.script:
             texto = READING_TEXT_LONG if duration_s >= 18.0 else READING_TEXT
         return replace(self, duration_s=duration_s, reading_text=texto)
 
@@ -306,6 +351,121 @@ SILENT_PLAN = RecordingPlan(
         "Misma posición que en el otro clip",
     ),
 )
+
+
+LONG_SILENT_PLAN = RecordingPlan(
+    name="Silencio LARGO (reuniones largas)",
+    kind="silent",
+    duration_s=90.0,
+    lead_in_s=1.0,
+    tail_s=3.0,
+    min_duration_s=30.0,
+    max_duration_s=180.0,
+    script=(
+        ("Escucha mirando a la cámara", "Parpadeo natural, boca cerrada."),
+        ("Mira la pantalla, como leyendo", "Los ojos bajan un poco; la cabeza casi no se mueve."),
+        ("Vuelve a mirar a la cámara", "Asiente una vez, muy leve, si te sale natural."),
+        ("Pequeño cambio de postura", "Acomódate en la silla, despacio, y vuelve al centro."),
+        ("Escucha con atención", "Quizá una media sonrisa breve. Boca cerrada."),
+        ("Mira un momento a un lado", "Como pensando. Vuelve en 2-3 s."),
+        ("Respira hondo una vez", "Sin bostezar. Hombros relajados."),
+        ("Escucha mirando a la cámara", "Quieto pero vivo, como en una reunión de verdad."),
+    ),
+    checklist=(
+        "Boca cerrada todo el clip",
+        "Movimientos lentos y pequeños",
+        "Nada de manos en la cara",
+        "Mismo encuadre y luz que los demás clips",
+        "Volver siempre a la pose de referencia",
+    ),
+)
+"""Un silencio de minuto y medio con variedad: en reuniones de 1-2 horas un
+clip de 15 s en bucle se reconoce. Se añade a los «silencios extra»."""
+
+LONG_SPEAKING_PLAN = RecordingPlan(
+    name="Habla LARGA (reuniones largas)",
+    kind="speaking",
+    duration_s=60.0,
+    lead_in_s=0.8,
+    tail_s=2.0,
+    min_duration_s=20.0,
+    max_duration_s=120.0,
+    script=(
+        ("Cuenta qué hiciste ayer", "Habla con naturalidad, como en la reunión."),
+        ("Explica una tarea en curso", "Frases normales, con alguna pausa breve."),
+        ("Responde corto varias veces", "«Sí.» «Vale, de acuerdo.» «Lo reviso.» Pausa entre cada una."),
+        ("Describe un problema", "Ritmo tranquilo, alguna pausa para pensar."),
+        ("Propón un siguiente paso", "Mirada a la cámara, sin exagerar la boca."),
+        ("Despídete o cierra la idea", "Termina y deja la boca cerrada."),
+    ),
+    checklist=(
+        "Boca cerrada al empezar y al terminar",
+        "Ritmo de reunión, con pausas",
+        "Manos fuera del plano",
+        "Mirada al objetivo",
+    ),
+)
+"""Habla variada para que el director tenga muchas bocas distintas entre las
+que elegir según el volumen de la voz. Se añade a las «hablas extra»."""
+
+
+GESTURE_SCRIPTS: dict[str, tuple[tuple[str, str], ...]] = {
+    "saludar": (
+        ("Levanta la mano y saluda", "Mano a la altura del hombro, dentro del plano. Sonríe."),
+        ("Baja la mano despacio", "Sin prisa: que no desaparezca de golpe."),
+    ),
+    "sonreir": (
+        ("Sonríe", "Sonrisa natural, sin enseñar mucho los dientes."),
+        ("Relaja la sonrisa", "Poco a poco, hasta la boca cerrada."),
+    ),
+    "asentir": (
+        ("Asiente dos veces", "Movimiento corto de cabeza, como diciendo «sí»."),
+    ),
+    "negar": (
+        ("Niega suavemente", "Un giro corto a cada lado, como diciendo «no»."),
+    ),
+    "mirar_arriba": (
+        ("Mira hacia arriba", "Como pensando. La cabeza sube poco; sobre todo los ojos."),
+        ("Vuelve a mirar a la cámara", "Despacio."),
+    ),
+    "mirar_izquierda": (
+        ("Mira a tu izquierda", "Como si alguien te hablara desde ese lado."),
+        ("Vuelve a mirar a la cámara", "Despacio."),
+    ),
+    "mirar_derecha": (
+        ("Mira a tu derecha", "Como si alguien te hablara desde ese lado."),
+        ("Vuelve a mirar a la cámara", "Despacio."),
+    ),
+    "reir": (
+        ("Ríe brevemente", "Una risa corta y natural, sin sonido fuerte."),
+        ("Recupera la calma", "Hasta la boca cerrada."),
+    ),
+}
+
+
+def gesture_plan(name: str, duration_s: float = 3.0) -> RecordingPlan:
+    """Plan para grabar un gesto: neutra → gesto → neutra."""
+    from .gestures import GESTURES, gesture_label
+
+    if name not in GESTURES:
+        raise ValueError(f"Gesto desconocido: {name!r}.")
+    return RecordingPlan(
+        name=f"Gesto: {gesture_label(name)}",
+        kind="gesture",
+        duration_s=duration_s,
+        lead_in_s=0.6,
+        tail_s=0.8,
+        min_duration_s=2.0,
+        max_duration_s=6.0,
+        gesture=name,
+        script=GESTURE_SCRIPTS[name],
+        checklist=(
+            "Empieza y termina en la pose neutra",
+            "Mismo encuadre y luz que los demás clips",
+            "Gesto dentro del plano",
+            "Sin hablar",
+        ),
+    ).with_duration(duration_s)
 
 
 # --------------------------------------------------------------------------- #
@@ -741,3 +901,28 @@ def draw_framing_guides(bgr: np.ndarray) -> np.ndarray:
     mx = int(w * 0.20)
     cv2.rectangle(salida, (mx, int(h * 0.08)), (w - mx, h), tenue, 1)
     return salida
+
+
+def first_frame(path: str | Path) -> np.ndarray | None:
+    """Primer fotograma BGR de un clip, o None si no se puede leer."""
+    cap = cv2.VideoCapture(str(path))
+    try:
+        ok, frame = cap.read()
+    finally:
+        cap.release()
+    return frame if ok and frame is not None else None
+
+
+def draw_reference_ghost(bgr: np.ndarray, reference: np.ndarray | None, alpha: float = 0.35) -> np.ndarray:
+    """Superpone, semitransparente, la pose de referencia sobre la vista previa.
+
+    Solo para la vista previa: ayuda a colocarse exactamente igual que en el
+    clip de silencio principal (misma distancia, altura y luz), que es lo que
+    hace que los clips enlacen sin salto. Nunca se escribe en la grabación.
+    """
+    if reference is None:
+        return bgr
+    h, w = bgr.shape[:2]
+    ref = reference if reference.shape[:2] == (h, w) else cv2.resize(reference, (w, h), interpolation=cv2.INTER_AREA)
+    alpha = float(min(1.0, max(0.0, alpha)))
+    return cv2.addWeighted(bgr, 1.0 - alpha, ref, alpha, 0.0)

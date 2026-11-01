@@ -28,6 +28,7 @@ from ..config import AppConfig
 from ..output.sink import FrameSink, NullSink, SinkError, VirtualCamSink
 from .cache import ClipCache, ClipCacheError, bgr_to_nv12, nv12_to_bgr, to_display_bgr
 from .composer import ComposeInfo, FrameComposer, RenderState
+from .director import Director, DirectorInfo, DirectorState, GestureResult, VoiceInput
 from .effects import EffectChain, limit_opencv_threads
 
 __all__ = ["RenderStatus", "RenderEngine", "Pacer", "hires_timer"]
@@ -118,7 +119,7 @@ class Pacer:
 @dataclass(frozen=True, slots=True)
 class RenderStatus:
     running: bool = False
-    state: RenderState = RenderState.SILENT
+    state: RenderState | DirectorState = RenderState.SILENT
     target: VoiceState = VoiceState.SILENT
     frames_sent: int = 0
     transitions: int = 0
@@ -139,6 +140,51 @@ class RenderStatus:
     error: str = ""
     warning: str = ""
 
+    # --- Modo director (vacíos/cero en modo clásico) ---
+    mode: str = "classic"
+    clip: str = ""
+    """Clip que se está emitiendo."""
+
+    gesture: str = ""
+    pending_gesture: str = ""
+    gestures_available: tuple[str, ...] = ()
+    gesture_latency_ms: float = -1.0
+    """Última latencia medida petición -> primer fotograma del gesto (-1 = ninguna)."""
+
+    gesture_latency_max_ms: float = -1.0
+    jumps: int = 0
+    morphs: int = 0
+    degraded_events: int = 0
+    voice_age_ms: float = -1.0
+    """Antigüedad del dato de voz usado en el último fotograma: el retardo
+    entre el final de la trama de audio analizada y el render (-1 = desconocido)."""
+
+    mouth_target: float = 0.0
+    micro_pause: bool = False
+    video_paused: bool = False
+    """Pausa manual: la salida repite la última imagen válida. Se indica en la
+    interfaz local; la imagen emitida no lleva marcas."""
+
+    anchor_transitions: int = 0
+    fallback_transitions: int = 0
+    segment_changes: int = 0
+    interrupted_transitions: int = 0
+    discontinuities: int = 0
+    """Fotogramas no consecutivos fuera de una transición (debe ser 0)."""
+
+
+def _to_voice_input(value) -> tuple[VoiceInput, float]:  # noqa: ANN001
+    """Acepta VoiceState, VoiceInput o VoiceStatus. Devuelve (entrada, t_monotonic)."""
+    if isinstance(value, VoiceInput):
+        return value, 0.0
+    if isinstance(value, VoiceState):
+        return VoiceInput(value, 1.0 if value is VoiceState.SPEAKING else 0.0), 0.0
+    state = getattr(value, "state", VoiceState.SILENT)
+    default = 1.0 if state is VoiceState.SPEAKING else 0.0
+    mouth = float(getattr(value, "mouth_target", default))
+    pause = bool(getattr(value, "micro_pause", False))
+    return VoiceInput(state, mouth, pause), float(getattr(value, "t_monotonic", 0.0) or 0.0)
+
 
 # --------------------------------------------------------------------------- #
 
@@ -152,16 +198,26 @@ class RenderEngine:
         cfg: AppConfig,
         speaking: ClipCache,
         silent: ClipCache,
-        voice_state: "callable[[], VoiceState]",  # noqa: F821
+        voice_state: "callable[[], VoiceState | VoiceInput]",  # noqa: F821
         *,
         sink: FrameSink | None = None,
+        director: Director | None = None,
     ) -> None:
+        """`voice_state` puede devolver VoiceState (modo clásico, compatibilidad),
+        VoiceInput o directamente el VoiceStatus del hilo de audio.
+
+        Con `director` se usa el modo director; sin él, el compositor clásico.
+        """
         self.cfg = cfg
         self.speaking_cache = speaking
         self.silent_cache = silent
         self._voice_state = voice_state
         self._external_sink = sink
 
+        self.director = director
+        self._voice_age_ms = -1.0
+        self._mouth_target = 0.0
+        self._micro_pause = False
         self.composer = FrameComposer(cfg.video, speaking, silent)
         self.effects = EffectChain(cfg.effects)
         self.pacer = Pacer(cfg.video.fps)
@@ -254,13 +310,19 @@ class RenderEngine:
             self._apply_sink()
 
         try:
-            voice = self._voice_state()
+            voice, t_voice = _to_voice_input(self._voice_state())
         except Exception:
-            voice = VoiceState.SILENT
+            voice, t_voice = VoiceInput(), 0.0
 
         frame, info = self._compose(voice)
         frame = self._apply_effects(frame)
+        # Salida limpia: nada se dibuja sobre la imagen emitida. Los estados
+        # (silencio, habla, gesto, pausa) solo se muestran en la ventana local
+        # y en la bandeja.
         self._emit(frame)
+        self._voice_age_ms = (time.perf_counter() - t_voice) * 1000.0 if t_voice > 0 else -1.0
+        self._mouth_target = voice.mouth
+        self._micro_pause = voice.pause
         self._update_preview(frame, started)
 
         finished = time.perf_counter()
@@ -271,9 +333,52 @@ class RenderEngine:
             del self._durations[: -self.STATS_WINDOW]
         self._publish_stats(info)
 
-    def _compose(self, voice: VoiceState) -> tuple[np.ndarray, ComposeInfo]:
+    # ------------------------------------------------------------------ #
+    # Gestos (seguros desde el hilo de la UI)
+    # ------------------------------------------------------------------ #
+
+    def request_gesture(self, name: str) -> GestureResult:
+        if self.director is None:
+            return GestureResult(
+                False,
+                "Los gestos necesitan el modo de reproducción «director» "
+                "(pestaña Videos).",
+            )
+        return self.director.request_gesture(name)
+
+    def cancel_gesture(self) -> None:
+        if self.director is not None:
+            self.director.cancel_gesture()
+
+    def pause_video(self) -> None:
+        if self.director is not None:
+            self.director.pause_video()
+
+    def resume_video(self) -> None:
+        if self.director is not None:
+            self.director.resume_video()
+
+    def toggle_video_pause(self) -> bool:
+        """Alterna la pausa manual (solo modo director). True si queda en pausa."""
+        return self.director.toggle_video_pause() if self.director is not None else False
+
+    @property
+    def video_paused(self) -> bool:
+        return self.director is not None and self.director.video_paused
+
+    def available_gestures(self) -> list[str]:
+        return self.director.available_gestures() if self.director is not None else []
+
+    def _compose(self, voice: VoiceInput) -> tuple[np.ndarray, ComposeInfo | DirectorInfo]:
+        if self.director is not None:
+            # El director gestiona sus propios fallos de lectura (estado DEGRADED).
+            frame, dinfo = self.director.step(voice)
+            self._last_good = frame
+            if dinfo.message:
+                self._publish(warning=dinfo.message)
+            return frame, dinfo
         try:
-            frame, info = self.composer.step(voice)
+            frame, info = self.composer.step(voice.state)
             self._last_good = frame
             return frame, info
         except (ClipCacheError, OSError, ValueError) as exc:
@@ -428,7 +533,7 @@ class RenderEngine:
 
     # ------------------------------------------------------------------ #
 
-    def _publish_stats(self, info: ComposeInfo) -> None:
+    def _publish_stats(self, info: ComposeInfo | DirectorInfo) -> None:
         durations = self._durations
         avg = sum(durations) / len(durations) if durations else 0.0
         worst = max(durations) if durations else 0.0
@@ -444,11 +549,37 @@ class RenderEngine:
             if span > 0:
                 effective = (len(self._frame_times) - 1) / span
 
+        extra: dict = {}
+        d = self.director
+        if d is not None:
+            lat = list(d.stats.gesture_latencies_ms)
+            extra = dict(
+                mode="director",
+                clip=info.clip,
+                gesture=info.gesture,
+                pending_gesture=info.pending_gesture,
+                gestures_available=tuple(d.available_gestures()),
+                gesture_latency_ms=lat[-1] if lat else -1.0,
+                gesture_latency_max_ms=max(lat) if lat else -1.0,
+                jumps=d.stats.jumps,
+                morphs=d.stats.morphs,
+                degraded_events=d.stats.degraded_events,
+                video_paused=d.video_paused,
+                anchor_transitions=d.stats.anchor_transitions,
+                fallback_transitions=d.stats.fallback_transitions,
+                segment_changes=d.stats.segment_changes,
+                interrupted_transitions=d.stats.interrupted_transitions,
+                discontinuities=d.stats.discontinuities,
+            )
         self._publish(
             state=info.state,
             target=info.target,
             frames_sent=frames,
-            transitions=self.composer.transitions,
+            transitions=(d.transitions if d is not None else self.composer.transitions),
+            voice_age_ms=self._voice_age_ms,
+            mouth_target=self._mouth_target,
+            micro_pause=self._micro_pause,
+            **extra,
             fps_effective=effective,
             fps_capacity=(1000.0 / avg) if avg > 0 else 0.0,
             late_frames=self.pacer.late_frames,
@@ -461,3 +592,4 @@ class RenderEngine:
     def _publish(self, **changes) -> None:
         with self._status_lock:
             self._status = replace(self._status, **changes)
+

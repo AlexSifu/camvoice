@@ -1,5 +1,8 @@
 # Guion de grabación
 
+> Para reuniones largas (silencios y hablas extra) y para grabar los gestos,
+> ver también [GUIA_GRABACION_Y_GESTOS.md](GUIA_GRABACION_Y_GESTOS.md).
+
 Cómo grabar los dos clips para que el resultado sea lo mejor posible. **La
 calidad depende más de estos dos minutos de grabación que de cualquier ajuste
 del programa.**

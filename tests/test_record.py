@@ -480,3 +480,101 @@ def test_un_texto_vacio_no_rompe_el_guion():
     cues = vacio.cues()
     assert cues[0].start_s == 0.0
     assert cues[-1].end_s == pytest.approx(10.0)
+
+
+# --------------------------------------------------------------------------- #
+# Planes de gestos y planes largos
+# --------------------------------------------------------------------------- #
+
+from camvoice.gestures import GESTURES  # noqa: E402
+from camvoice.record import (  # noqa: E402
+    GESTURE_SCRIPTS,
+    LONG_SILENT_PLAN,
+    LONG_SPEAKING_PLAN,
+    draw_reference_ghost,
+    first_frame,
+    gesture_plan,
+)
+
+
+def _sin_huecos(plan):
+    cues = plan.cues()
+    assert cues[0].start_s == 0.0
+    assert cues[-1].end_s == pytest.approx(plan.duration_s)
+    for a, b in zip(cues, cues[1:]):
+        assert a.end_s == pytest.approx(b.start_s)
+        assert a.end_s >= a.start_s
+
+
+def test_hay_guion_para_cada_gesto():
+    assert set(GESTURE_SCRIPTS) == set(GESTURES)
+
+
+@pytest.mark.parametrize("nombre", sorted(GESTURES))
+def test_el_plan_de_gesto_empieza_y_acaba_neutro(nombre):
+    plan = gesture_plan(nombre)
+    assert plan.kind == "gesture" and plan.gesture == nombre
+    _sin_huecos(plan)
+    cues = plan.cues()
+    assert "BOCA CERRADA" in cues[0].title
+    assert "neutra" in cues[-1].title.lower()
+    assert all(c.critical for c in cues)
+    assert plan.reading_phrases() == []
+
+
+def test_la_duracion_del_gesto_se_acota_a_su_rango():
+    assert gesture_plan("saludar", 0.5).duration_s == pytest.approx(2.0)
+    assert gesture_plan("saludar", 30).duration_s == pytest.approx(6.0)
+
+
+def test_un_gesto_desconocido_es_un_error():
+    with pytest.raises(ValueError):
+        gesture_plan("bailar")
+
+
+@pytest.mark.parametrize("plan", [LONG_SILENT_PLAN, LONG_SPEAKING_PLAN])
+def test_los_planes_largos_admiten_mas_de_un_minuto(plan):
+    largo = plan.with_duration(plan.max_duration_s)
+    assert largo.duration_s > 60.0
+    _sin_huecos(largo)
+    # Cada paso del guion aparece y dura varios segundos.
+    titulos = [c.title for c in largo.cues()]
+    for titulo, _ in plan.script:
+        assert titulo in titulos
+    assert plan.with_duration(1).duration_s == pytest.approx(plan.min_duration_s)
+
+
+def test_el_silencio_largo_nunca_pide_hablar():
+    for cue in LONG_SILENT_PLAN.cues():
+        assert "lee" not in cue.title.lower()
+    assert LONG_SILENT_PLAN.reading_phrases() == []
+
+
+def test_la_habla_larga_acaba_cerrando_la_boca():
+    assert "CIERRA LA BOCA" in LONG_SPEAKING_PLAN.cues()[-1].title
+
+
+def test_los_planes_cortos_siguen_igual():
+    """Los nuevos campos no cambian los dos clips principales."""
+    assert SPEAKING_PLAN.with_duration(200).duration_s == pytest.approx(60.0)
+    assert SILENT_PLAN.with_duration(1).duration_s == pytest.approx(4.0)
+    assert SPEAKING_PLAN.reading_phrases()
+
+
+def test_la_silueta_de_referencia_mezcla_sin_tocar_el_original():
+    vista = np.zeros((48, 64, 3), np.uint8)
+    ref = np.full((24, 32, 3), 200, np.uint8)  # otro tamaño: se reescala
+    salida = draw_reference_ghost(vista, ref, alpha=0.5)
+    assert salida.shape == vista.shape
+    assert int(salida.mean()) == 100
+    assert vista.max() == 0
+    assert draw_reference_ghost(vista, None) is vista
+
+
+def test_primer_fotograma_de_un_clip(tmp_path):
+    from camvoice.testclips import make_test_clips
+
+    _, sil = make_test_clips(tmp_path, width=64, height=48, fps=10, seconds=0.5)
+    frame = first_frame(sil)
+    assert frame is not None and frame.shape == (48, 64, 3)
+    assert first_frame(tmp_path / "no-existe.mp4") is None

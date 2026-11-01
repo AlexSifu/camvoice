@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -48,7 +49,13 @@ from ..audio.capture import AudioError, DeviceInfo, list_input_devices
 from ..config import AppConfig, EffectsConfig
 from ..controller import Session, SessionError
 from ..video.cache import ClipCacheError, probe_clip
+from ..gestures import CANCEL, PAUSE, gesture_label
+from ..permission import MODE_MANUAL, SPEECH_TOGGLE
+from .gestures_tab import GesturesTab
+from .hotkeys import HotkeyManager, default_api, install_native_filter
+from .library_tab import LibraryTab
 from .recorder_tab import RecorderTab
+from .speech_control import SpeechControlCard
 from .tray import TrayController, tray_available
 from .widgets import (
     STYLESHEET,
@@ -75,6 +82,31 @@ RESOLUTIONS = [
 ]
 
 FPS_OPTIONS = [10, 12, 15, 20, 24, 25, 30]
+
+VAD_PRESETS: dict[str, dict[str, float | int]] = {
+    "Por defecto": {"attack_ms": 120, "release_ms": 600, "pause_tolerance_ms": 350},
+    "Conversación (respuestas cortas)": {
+        "attack_ms": 80, "release_ms": 700, "pause_tolerance_ms": 450,
+    },
+    "Monólogo (hablo seguido)": {
+        "attack_ms": 150, "release_ms": 900, "pause_tolerance_ms": 600,
+    },
+}
+"""Tiempos del detector para cada forma de hablar.
+
+«Conversación» abre antes (un «sí» de 200 ms ya mueve la boca) y aguanta más
+las pausas entre frases; «Monólogo» evita volver a silencio al respirar.
+"""
+
+PRERECORDED_TEXT = (
+    "● VIDEO PREGRABADO — la cámara «CamVoice» emite clips grabados, "
+    "no la imagen en directo"
+)
+
+PAUSED_TEXT = (
+    "⏸ VÍDEO EN PAUSA — la cámara «CamVoice» repite la última imagen "
+    "(imagen congelada). Usa el atajo de pausa o «Reanudar video» para seguir."
+)
 
 EFFECT_PRESETS: dict[str, dict[str, float | bool]] = {
     "Sin efectos": {},
@@ -143,6 +175,11 @@ class MainWindow(QMainWindow):
         self._last_message = ""
         self.tray: TrayController | None = None
         self._really_quit = False
+        self._running = False
+        self._preview_only = False
+        self._saved_output_enabled: bool | None = None
+        self.hotkeys = HotkeyManager(self._on_gesture, default_api())
+        self._hotkey_filter = None
 
         self.setWindowTitle("Cámara virtual por voz")
         self.resize(1180, 780)
@@ -156,6 +193,13 @@ class MainWindow(QMainWindow):
         self._update_clip_info()
         self._set_running(False)
         self._setup_tray()
+        self._setup_hotkeys()
+        # La lectura de Teams arranca ya (hilo propio, solo lectura) para que
+        # el estado se vea antes de iniciar la cámara.
+        self.session.start_meeting_monitor()
+        if not self.library_tab.has_library:
+            # Primera vez: lo primero es importar las grabaciones.
+            self.tabs.setCurrentWidget(self.library_page)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._refresh)
@@ -189,6 +233,30 @@ class MainWindow(QMainWindow):
         self._apply_badge("-")
         layout.addWidget(self.state_badge)
 
+        # Indicación visible de que la cámara emite video grabado. No se puede
+        # ocultar mientras la sesión corre: es la regla, no una opción.
+        self.prerecorded_indicator = QLabel(PRERECORDED_TEXT)
+        self.prerecorded_indicator.setWordWrap(True)
+        self.prerecorded_indicator.setAlignment(Qt.AlignCenter)
+        self.prerecorded_indicator.setStyleSheet(
+            "background:#3a1f22; color:#ffb3b8; padding:6px; border-radius:6px;"
+            "font-weight:600;"
+        )
+        self.prerecorded_indicator.setVisible(False)
+        layout.addWidget(self.prerecorded_indicator)
+
+        # Pausa manual: solo se indica aquí y en la bandeja; la imagen emitida
+        # no lleva marcas (salida limpia) y no simula fallos de conexión.
+        self.paused_indicator = QLabel(PAUSED_TEXT)
+        self.paused_indicator.setWordWrap(True)
+        self.paused_indicator.setAlignment(Qt.AlignCenter)
+        self.paused_indicator.setStyleSheet(
+            "background:#2b2b2b; color:#f0f0f0; padding:6px; border-radius:6px;"
+            "font-weight:600; border:1px solid #8b949e;"
+        )
+        self.paused_indicator.setVisible(False)
+        layout.addWidget(self.paused_indicator)
+
         self.preview = QLabel("La vista previa aparecerá al iniciar.")
         self.preview.setAlignment(Qt.AlignCenter)
         self.preview.setMinimumSize(420, 300)
@@ -211,6 +279,15 @@ class MainWindow(QMainWindow):
         medidor.add(self.detector_info)
         layout.addWidget(medidor)
 
+        # Autorización de habla: voz física ≠ habla autorizada. Ver permission.py.
+        self.speech_card = SpeechControlCard(
+            self.cfg.speech,
+            on_mode=self._on_speech_mode,
+            on_toggle=self._on_speech_toggle,
+            on_hotkey=self._on_speech_hotkey,
+        )
+        layout.addWidget(self.speech_card)
+
         self.progress = QProgressBar()
         self.progress.setVisible(False)
         layout.addWidget(self.progress)
@@ -221,12 +298,26 @@ class MainWindow(QMainWindow):
         self.banner.setFrameShape(QFrame.StyledPanel)
         layout.addWidget(self.banner)
 
+        self.camera_status = QLabel()
+        self.camera_status.setAlignment(Qt.AlignCenter)
+        self.camera_status.setWordWrap(True)
+        layout.addWidget(self.camera_status)
+
         botones = QHBoxLayout()
         botones.setSpacing(8)
-        self.start_button = QPushButton("▶   Iniciar")
+        self.preview_button = QPushButton("👁   Iniciar vista previa")
+        self.preview_button.setMinimumHeight(42)
+        self.preview_button.setToolTip(
+            "Arranca el detector y el video solo en esta ventana, sin emitir por la "
+            "cámara virtual. Útil para comprobar transiciones y gestos."
+        )
+        self.preview_button.clicked.connect(lambda: self._on_start(preview=True))
+        botones.addWidget(self.preview_button, 2)
+
+        self.start_button = QPushButton("▶   Iniciar cámara virtual")
         self.start_button.setObjectName("primary")
         self.start_button.setMinimumHeight(42)
-        self.start_button.clicked.connect(self._on_start)
+        self.start_button.clicked.connect(lambda: self._on_start())
         botones.addWidget(self.start_button, 2)
 
         self.stop_button = QPushButton("■   Detener")
@@ -251,9 +342,23 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
 
         self.tabs = QTabWidget()
-        self.recorder_tab = RecorderTab(self._on_clip_recorded)
+        self.recorder_tab = RecorderTab(
+            self._on_clip_recorded, reference_clip=lambda: self.cfg.video.silent_clip
+        )
+        self.gestures_tab = GesturesTab(
+            self.cfg,
+            on_gesture=self._on_gesture,
+            on_hotkeys_changed=self._apply_hotkeys,
+            on_library_changed=self._refresh_pools,
+        )
+        self.library_tab = LibraryTab(
+            self.cfg, on_imported=self._on_library_imported, is_running=lambda: self._running
+        )
         self.tabs.addTab(self._scrollable(self._tab_clips()), "Videos")
         self.tabs.addTab(self._scrollable(self.recorder_tab), "Grabar")
+        self.tabs.addTab(self._scrollable(self.gestures_tab), "Gestos")
+        self.library_page = self._scrollable(self.library_tab)
+        self.tabs.addTab(self.library_page, "Biblioteca")
         self.tabs.addTab(self._scrollable(self._tab_audio()), "Micrófono")
         self.tabs.addTab(self._scrollable(self._tab_detector()), "Detector")
         self.tabs.addTab(self._scrollable(self._tab_effects()), "Efectos")
@@ -368,6 +473,56 @@ class MainWindow(QMainWindow):
         reproduccion.add(self.resume_window)
 
         layout.addWidget(reproduccion)
+
+        biblioteca = Card("varios clips y transiciones (modo director)")
+        self.playback_combo = combo(
+            [
+                ("Director: varios clips, boca guiada por la voz, gestos", "director"),
+                ("Clásico: un clip de habla y uno de silencio", "classic"),
+            ],
+            ayuda="El director alterna entre todos los clips del grupo sin "
+            "repetir, salta a fotogramas parecidos para que no se note el corte "
+            "y elige la boca según el volumen de tu voz. Si algo falla al "
+            "prepararlo, se usa el modo clásico automáticamente.",
+        )
+        self.playback_combo.currentIndexChanged.connect(self._on_playback_changed)
+        biblioteca.add(labelled_row("Reproducción", self.playback_combo))
+
+        self.normalize_check = QCheckBox("Igualar encuadre y color entre clips")
+        self.normalize_check.setToolTip(
+            "Corrige pequeños desplazamientos de cámara y cambios de luz entre "
+            "tomas, tomando como referencia el clip de silencio principal."
+        )
+        self.normalize_check.stateChanged.connect(self._on_playback_changed)
+        biblioteca.add(self.normalize_check)
+
+        self.pool_lists: dict[str, QListWidget] = {}
+        self.pool_buttons: list[QPushButton] = []
+        for kind, titulo in (("silent", "Silencios extra"), ("speaking", "Hablas extra")):
+            biblioteca.add(QLabel(f"<b>{titulo}</b> (además del principal)"))
+            lista = QListWidget()
+            lista.setMaximumHeight(84)
+            self.pool_lists[kind] = lista
+            biblioteca.add(lista)
+            fila = QHBoxLayout()
+            anadir = QPushButton("Añadir…")
+            anadir.clicked.connect(lambda _=False, k=kind: self._add_pool_clip(k))
+            quitar = QPushButton("Quitar")
+            quitar.clicked.connect(lambda _=False, k=kind: self._remove_pool_clip(k))
+            fila.addWidget(anadir)
+            fila.addWidget(quitar)
+            fila.addStretch(1)
+            self.pool_buttons += [anadir, quitar]
+            biblioteca.add_layout(fila)
+        nota = QLabel(
+            "Para una reunión larga: 3-4 silencios de 1-2 min (miradas, "
+            "parpadeos, pequeños cambios de postura) y 2-3 hablas. Mismo "
+            "encuadre y luz en todos. Se guarda en el manifiesto de la biblioteca."
+        )
+        nota.setWordWrap(True)
+        nota.setStyleSheet("color:#8b949e; font-size:11px;")
+        biblioteca.add(nota)
+        layout.addWidget(biblioteca)
         layout.addStretch(1)
         return pagina
 
@@ -415,6 +570,23 @@ class MainWindow(QMainWindow):
 
     def _tab_detector(self) -> QWidget:
         pagina, layout = self._page()
+
+        forma = Card("cómo hablas en la reunión")
+        self.vad_preset = combo(
+            [(nombre, nombre) for nombre in VAD_PRESETS],
+            ayuda="Ajusta los tiempos de activación y permanencia. Los "
+            "deslizadores de abajo siguen siendo editables.",
+        )
+        self.vad_preset.currentIndexChanged.connect(self._on_vad_preset)
+        forma.add(labelled_row("Preajuste", self.vad_preset))
+        auriculares = QLabel(
+            "Usa <b>auriculares</b>: con altavoces, la voz de los demás llega al "
+            "micrófono y el detector la toma por la tuya."
+        )
+        auriculares.setWordWrap(True)
+        auriculares.setObjectName("dim")
+        forma.add(auriculares)
+        layout.addWidget(forma)
 
         motor = Card("motor de detección")
         self.vad_backend = combo(
@@ -708,9 +880,142 @@ class MainWindow(QMainWindow):
             on_start=self._on_start,
             on_stop=self._on_stop,
             on_quit=self._quit_from_tray,
+            on_gesture=self._on_gesture,
+            on_hotkeys_toggled=self.gestures_tab.set_hotkeys_enabled,
+            on_speech_toggled=self._on_speech_toggle,
             parent=self,
         )
+        self.tray.set_hotkeys_checked(self.cfg.gestures.hotkeys_enabled)
         self.tray.show()
+
+    # ------------------------------------------------------------------ #
+    # Gestos y atajos
+    # ------------------------------------------------------------------ #
+
+    def _setup_hotkeys(self) -> None:
+        if self.hotkeys.available:
+            app = QApplication.instance()
+            if app is not None:
+                self._hotkey_filter = install_native_filter(app, self.hotkeys)
+        self._apply_hotkeys()
+
+    def _apply_hotkeys(self) -> None:
+        """(Re)registra los atajos según el manifiesto y el interruptor."""
+        wanted = self.gestures_tab.wanted_hotkeys()
+        # El atajo de autorizar habla va el último: ante una colisión ganan
+        # los gestos y el conflicto se muestra, nunca se resuelve en silencio.
+        if self.cfg.speech.manual_hotkey.strip():
+            wanted[SPEECH_TOGGLE] = self.cfg.speech.manual_hotkey.strip()
+        problemas = self.hotkeys.apply(wanted)
+        if self.cfg.gestures.hotkeys_enabled:
+            problemas = self.hotkeys.resume()
+        else:
+            self.hotkeys.suspend()
+        if self.tray is not None:
+            self.tray.set_hotkeys_checked(self.cfg.gestures.hotkeys_enabled)
+        texto = self.hotkeys.describe()
+        if problemas:
+            texto += "\n⚠ " + "\n⚠ ".join(problemas)
+        self.gestures_tab.hotkey_status.setText(texto)
+
+    def _on_gesture(self, name: str) -> None:
+        """Botón, menú de bandeja o atajo: pide el gesto a la sesión."""
+        if name == SPEECH_TOGGLE:
+            self._on_speech_toggle()
+            return
+        if not self.session.running:
+            self.statusBar().showMessage("Inicia la cámara para usar los gestos.", 4000)
+            return
+        if name == CANCEL:
+            self.session.cancel_gesture()
+            self.statusBar().showMessage("Gesto cancelado.", 2500)
+            return
+        if name == PAUSE:
+            engine = self.session.engine
+            if engine is None or engine.director is None:
+                self.statusBar().showMessage(
+                    "La pausa de video necesita el modo director (pestaña Videos).", 5000
+                )
+                return
+            en_pausa = self.session.toggle_video_pause()
+            self.paused_indicator.setVisible(en_pausa)
+            self.statusBar().showMessage(
+                "Vídeo en pausa (imagen congelada)." if en_pausa else "Vídeo reanudado.", 3000
+            )
+            return
+        resultado = self.session.request_gesture(name)
+        if resultado.accepted:
+            self.statusBar().showMessage(f"Gesto: {gesture_label(name)}", 2500)
+        else:
+            self.statusBar().showMessage(resultado.message, 6000)
+            if self.isHidden() and self.tray is not None:
+                self.tray.notify("Gesto no disponible", resultado.message)
+
+    # ------------------------------------------------------------------ #
+    # Control de habla
+    # ------------------------------------------------------------------ #
+
+    def _on_speech_mode(self, mode: str) -> None:
+        """Cambiar de modo nunca autoriza habla: el permiso manual vuelve a
+        Bloquear y la decisión se reevalúa con la voz actual."""
+        self.session.set_speech_mode(mode)
+        self.speech_card.set_mode_silently(mode)
+        if mode == MODE_MANUAL:
+            self.statusBar().showMessage(
+                "Control manual: CamVoice no verifica el mute de Teams/Meet. Habla bloqueada "
+                "hasta que pulses «Autorizar habla».",
+                7000,
+            )
+        else:
+            self.statusBar().showMessage(
+                "Control automático: habla solo con el micrófono de Teams activo.", 5000
+            )
+        self._refresh_speech(force=True)
+
+    def _on_speech_toggle(self) -> None:
+        """Botón, bandeja o atajo global: alterna el permiso manual."""
+        if self.session.permission.mode != MODE_MANUAL:
+            texto = (
+                "El permiso manual solo se aplica en «Control de habla: Manual». "
+                "En automático manda el estado del micrófono de Teams."
+            )
+            self.statusBar().showMessage(texto, 6000)
+            if self.isHidden() and self.tray is not None:
+                self.tray.notify("Control de habla", texto)
+            self._refresh_speech(force=True)
+            return
+        if not self.session.running:
+            self.statusBar().showMessage("Inicia la cámara para autorizar el habla.", 4000)
+            self._refresh_speech(force=True)
+            return
+        permitido = self.session.toggle_manual_speech()
+        auth = self.session.speech_authorization()
+        if permitido and not auth.allowed:
+            texto = f"Permiso manual activado, pero el habla sigue bloqueada: {auth.reason}"
+        elif permitido:
+            texto = "Habla autorizada (modo manual; Teams no verificado)."
+        else:
+            texto = "Habla bloqueada."
+        self.statusBar().showMessage(texto, 5000)
+        if self.isHidden() and self.tray is not None:
+            self.tray.notify("Control de habla", texto)
+        self._refresh_speech(force=True)
+
+    def _on_speech_hotkey(self, texto: str) -> None:
+        self.cfg.speech.manual_hotkey = texto
+        self._apply_hotkeys()
+
+    def _refresh_speech(self, *, force: bool = False) -> None:
+        estado = self.session.status()
+        if force:
+            self.speech_card._last_key = ()
+        self.speech_card.update_status(
+            estado.speech,
+            physical_speaking=estado.physical_speaking,
+            running=estado.render.running,
+        )
+        if self.tray is not None:
+            self.tray.update_speech(estado.speech, running=estado.render.running)
 
     def _restore_from_tray(self) -> None:
         self.showNormal()
@@ -732,6 +1037,18 @@ class MainWindow(QMainWindow):
 
     def _on_clip_recorded(self, kind: str, ruta: str) -> None:
         """La pestaña Grabar acaba de producir un clip utilizable."""
+        if kind.startswith("gesture:"):
+            nombre = kind.split(":", 1)[1]
+            if self.gestures_tab.set_gesture_clip(nombre, ruta):
+                self.tabs.setCurrentIndex(2)  # Gestos
+                self.statusBar().showMessage(
+                    f"Gesto «{gesture_label(nombre)}» asignado: {ruta}", 6000
+                )
+            return
+        if kind in ("silent_extra", "speaking_extra"):
+            self.add_pool_path(kind.split("_", 1)[0], ruta)
+            self.tabs.setCurrentIndex(0)
+            return
         if kind == "speaking":
             self.cfg.video.speaking_clip = ruta
             self.speaking_path.setText(ruta)
@@ -790,6 +1107,9 @@ class MainWindow(QMainWindow):
         self.transition.set_silently(v.transition_ms)
         self.resume_window.set_silently(v.resume_window_ms)
         self.virtual_check.setChecked(o.enabled)
+        self.playback_combo.setCurrentIndex(max(0, self.playback_combo.findData(v.playback)))
+        self.normalize_check.setChecked(v.normalize_clips)
+        self._refresh_pools()
 
         self.vad_backend.setCurrentIndex(max(0, self.vad_backend.findData(d.backend)))
         self.aggressiveness.set_silently(d.aggressiveness)
@@ -830,6 +1150,8 @@ class MainWindow(QMainWindow):
         v.transition_ms = int(self.transition.value())
         v.resume_window_ms = int(self.resume_window.value())
         o.enabled = self.virtual_check.isChecked()
+        v.playback = self.playback_combo.currentData()
+        v.normalize_clips = self.normalize_check.isChecked()
         self.cfg.ui.minimize_to_tray = self.tray_check.isChecked()
         self.cfg.audio.device = self.mic_combo.currentData()
         self.cfg.audio.device_name = next(
@@ -992,6 +1314,59 @@ class MainWindow(QMainWindow):
         v.speaking_speed = float(self.speed_speaking.value())
         v.silent_speed = float(self.speed_silent.value())
 
+    def _on_vad_preset(self) -> None:
+        if self._loading:
+            return
+        ajustes = VAD_PRESETS.get(self.vad_preset.currentData(), {})
+        self.attack.set_silently(ajustes["attack_ms"])
+        self.release.set_silently(ajustes["release_ms"])
+        self.pause_tol.set_silently(ajustes["pause_tolerance_ms"])
+        self._apply_vad(**{k: int(v) for k, v in ajustes.items()})
+
+    def _on_playback_changed(self, _valor: int = 0) -> None:
+        if self._loading:
+            return
+        self.cfg.video.playback = self.playback_combo.currentData()
+        self.cfg.video.normalize_clips = self.normalize_check.isChecked()
+
+    def _refresh_pools(self) -> None:
+        lib = self.gestures_tab.library
+        for kind, lista in self.pool_lists.items():
+            lista.clear()
+            for ruta in getattr(lib, kind):
+                lista.addItem(Path(ruta).name)
+                lista.item(lista.count() - 1).setToolTip(ruta)
+
+    def _add_pool_clip(self, kind: str) -> None:
+        inicio = self.cfg.video.silent_clip or self.cfg.video.speaking_clip or ""
+        ruta, _ = QFileDialog.getOpenFileName(
+            self, "Añadir clip al grupo", str(Path(inicio).parent) if inicio else "", VIDEO_FILTER
+        )
+        if not ruta:
+            return
+        try:
+            probe_clip(ruta)
+        except ClipCacheError as exc:
+            QMessageBox.critical(self, "Video no utilizable", str(exc))
+            return
+        self.add_pool_path(kind, ruta)
+
+    def add_pool_path(self, kind: str, ruta: str) -> None:
+        lib = self.gestures_tab.library
+        grupo = getattr(lib, kind)
+        if ruta not in grupo:
+            grupo.append(ruta)
+            self.gestures_tab.save_library()
+        self.statusBar().showMessage("Clip añadido; se usará al volver a iniciar.", 4000)
+
+    def _remove_pool_clip(self, kind: str) -> None:
+        lista = self.pool_lists[kind]
+        fila = lista.currentRow()
+        grupo = getattr(self.gestures_tab.library, kind)
+        if 0 <= fila < len(grupo):
+            del grupo[fila]
+            self.gestures_tab.save_library()
+
     def _on_mic_changed(self) -> None:
         if self._loading:
             return
@@ -1046,7 +1421,29 @@ class MainWindow(QMainWindow):
     # Arranque y parada
     # ------------------------------------------------------------------ #
 
-    def _on_start(self) -> None:
+    def _on_library_imported(self) -> None:
+        """La pestaña Biblioteca importó o deshizo: clips principales, gestos y atajos."""
+        try:
+            self.cfg.save(self.config_file)
+        except OSError as exc:
+            self._show_message(f"No se pudo guardar la configuración: {exc}", "warn")
+        self._loading = True
+        try:
+            self._load_from_config()
+        finally:
+            self._loading = False
+        self._update_clip_info()
+        self.gestures_tab.reload()
+        self._refresh_pools()
+        self._apply_hotkeys()
+
+    def _on_start(self, preview: bool = False) -> None:
+        if self.library_tab.busy():
+            QMessageBox.information(
+                self, "Preparación en curso",
+                "Espera a que termine «Validar y preparar vídeos» (o cancélalo).",
+            )
+            return
         self._collect_into_config()
         errores = self.cfg.validate()
         if errores:
@@ -1055,8 +1452,14 @@ class MainWindow(QMainWindow):
             )
             return
 
+        # Vista previa = misma sesión sin cámara virtual; se restaura al detener.
+        self._preview_only = bool(preview)
+        if preview:
+            self._saved_output_enabled = self.cfg.output.enabled
+            self.cfg.output.enabled = False
         self.session.cfg = self.cfg
         self.start_button.setEnabled(False)
+        self.preview_button.setEnabled(False)
         self.progress.setVisible(True)
         self.progress.setRange(0, 0)
         self.statusBar().showMessage("Preparando los clips…")
@@ -1084,13 +1487,21 @@ class MainWindow(QMainWindow):
         self._worker = None
         self.progress.setVisible(False)
         self.start_button.setEnabled(True)
+        self.preview_button.setEnabled(True)
 
         if clips is None:
+            self._restore_output()
             self._show_message(error, "err")
             self.statusBar().showMessage("No se pudo preparar.", 5000)
             return
 
         detalle = f"{clips.speaking.describe()}\n{clips.silent.describe()}"
+        if clips.mode == "director":
+            detalle += (
+                f"\nModo director: {len(clips.silent_pool)} silencio(s), "
+                f"{len(clips.speaking_pool)} habla(s), "
+                f"gestos: {', '.join(gesture_label(g) for g in clips.gestures) or 'ninguno'}"
+            )
         detalle += f"\nCaché total: {clips.total_mb:.0f} MB"
         if clips.warnings:
             detalle += "\n\nAvisos:\n• " + "\n• ".join(clips.warnings)
@@ -1100,13 +1511,24 @@ class MainWindow(QMainWindow):
         try:
             self.session.start()
         except SessionError as exc:
+            self._restore_output()
             self._show_message(str(exc), "err")
             return
         self._set_running(True)
-        self.statusBar().showMessage("En marcha.", 4000)
+        self.statusBar().showMessage(
+            "Vista previa en marcha (sin cámara virtual)." if self._preview_only else "En marcha.",
+            4000,
+        )
+
+    def _restore_output(self) -> None:
+        if self._saved_output_enabled is not None:
+            self.cfg.output.enabled = self._saved_output_enabled
+            self._saved_output_enabled = None
+        self._preview_only = False
 
     def _on_stop(self) -> None:
         self.session.stop()
+        self._restore_output()
         self._set_running(False)
         self.preview.setPixmap(QPixmap())
         self.preview.setText("Detenido.")
@@ -1114,14 +1536,39 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Detenido.", 4000)
 
     def _set_running(self, corriendo: bool) -> None:
+        self._running = bool(corriendo)
         self.start_button.setEnabled(not corriendo)
+        self.preview_button.setEnabled(not corriendo)
         self.stop_button.setEnabled(corriendo)
+        self.prerecorded_indicator.setVisible(corriendo)
+        self._set_camera_status(corriendo, virtual=False)
+        self.library_tab.on_running_changed()
+        if not corriendo:
+            self.paused_indicator.setVisible(False)
         # Lo que invalida la caché de fotogramas no se toca en caliente.
         for widget in (
             self.speaking_button, self.silent_button, self.resolution,
             self.fps_combo, self.fit_combo, self.mirror_check,
+            self.playback_combo, self.normalize_check, *self.pool_buttons,
         ):
             widget.setEnabled(not corriendo)
+
+    def _set_camera_status(self, corriendo: bool, *, virtual: bool, device: str = "") -> None:
+        if not corriendo:
+            texto, fondo, color = "● Cámara detenida", "#22272e", "#8b949e"
+        elif virtual:
+            texto = f"● EMITIENDO VÍDEO PREGRABADO en la cámara virtual «{device or 'CamVoice'}»"
+            fondo, color = "#3a1f22", "#ffb3b8"
+        elif self._preview_only:
+            texto = "● Vista previa (VÍDEO PREGRABADO) — la cámara virtual no emite"
+            fondo, color = "#1f2d3a", "#9ecbff"
+        else:
+            texto = "● En marcha — abriendo la cámara virtual…"
+            fondo, color = "#2d2a1f", "#e3b341"
+        self.camera_status.setText(texto)
+        self.camera_status.setStyleSheet(
+            f"background:{fondo}; color:{color}; padding:6px; border-radius:6px; font-weight:600;"
+        )
 
     # ------------------------------------------------------------------ #
     # Refresco periódico
@@ -1153,15 +1600,44 @@ class MainWindow(QMainWindow):
                 f"ms/frame {render.avg_frame_ms:5.2f} (peor {render.worst_frame_ms:5.2f})   "
                 f"frames {render.frames_sent}   tardíos {render.late_frames}   "
                 f"cambios {render.transitions}"
+                + (
+                    f"\nmodo director · clip {render.clip or '-'}"
+                    f" · anclas {render.anchor_transitions}"
+                    f" · fundidos cortos {render.fallback_transitions}"
+                    f" · discontinuidades {render.discontinuities}"
+                    + (" · micro-pausa" if render.micro_pause else "")
+                    if render.mode == "director" else "\nmodo clásico"
+                )
             )
             self.virtual_status.setText(
                 f"Activa: {render.sink_device}" if render.virtual_output
                 else "Cámara virtual inactiva."
             )
+            self._set_camera_status(True, virtual=render.virtual_output, device=render.sink_device)
         else:
             self.metrics_label.setText("—")
 
+        self.gestures_tab.update_status(
+            running=render.running,
+            mode=render.mode,
+            available=render.gestures_available,
+            current=render.gesture,
+            latency_ms=render.gesture_latency_ms,
+            paused=render.running and render.video_paused,
+        )
+        self.paused_indicator.setVisible(render.running and render.video_paused)
+
+        self.speech_card.update_status(
+            estado.speech, physical_speaking=estado.physical_speaking, running=render.running
+        )
+
         if self.tray is not None:
+            self.tray.update_speech(estado.speech, running=render.running)
+            self.tray.set_gestures(
+                render.gestures_available,
+                enabled=render.running and render.mode == "director",
+                hotkeys=self.gestures_tab.library.hotkeys(),
+            )
             detalle = (
                 f"{render.fps_effective:.1f} FPS · {render.sink_device}"
                 if render.running and render.virtual_output
@@ -1234,7 +1710,9 @@ class MainWindow(QMainWindow):
             return
 
         self.timer.stop()
+        self.hotkeys.clear()
         self.recorder_tab.shutdown()
+        self.library_tab.shutdown()
         if self._thread is not None:
             self._thread.quit()
             self._thread.wait(2000)

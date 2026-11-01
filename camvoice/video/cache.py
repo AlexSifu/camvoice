@@ -153,11 +153,15 @@ def probe_clip(path: str | os.PathLike[str]) -> ClipProbe:
 # --------------------------------------------------------------------------- #
 
 
-def cache_key(path: str | os.PathLike[str], cfg: VideoConfig) -> str:
+def cache_key(path: str | os.PathLike[str], cfg: VideoConfig, variant: str = "") -> str:
     """Identidad de una caché: fuente + todos los parámetros que la afectan.
 
     Incluye tamaño y mtime del archivo original, así que reemplazar el video por
     otro con el mismo nombre invalida la caché automáticamente.
+
+    `variant` identifica un procesado adicional (p. ej. la normalización de
+    encuadre y color). Vacío produce exactamente la clave de versiones
+    anteriores, de modo que las cachés existentes se siguen reutilizando.
     """
     p = Path(path).resolve()
     try:
@@ -176,6 +180,8 @@ def cache_key(path: str | os.PathLike[str], cfg: VideoConfig) -> str:
         cfg.pixel_format,
         ",".join(str(int(c)) for c in cfg.letterbox_color),
     )
+    if variant:
+        parts = (*parts, variant)
     digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:20]
     return f"{p.stem[:28]}-{digest}"
 
@@ -281,12 +287,20 @@ def prepare_clip(
     force: bool = False,
     progress: ProgressFn | None = None,
     directory: Path | None = None,
+    transform: "Callable[[np.ndarray], np.ndarray] | None" = None,
+    variant: str = "",
 ) -> "ClipCache":
-    """Prepara (o reutiliza) la caché de un clip y devuelve el acceso abierto."""
+    """Prepara (o reutiliza) la caché de un clip y devuelve el acceso abierto.
+
+    `transform` se aplica a cada fotograma BGR ya encajado (después del espejo)
+    y debe ir acompañado de un `variant` que lo identifique en la clave.
+    """
+    if transform is not None and not variant:
+        raise ValueError("Un transform necesita un variant que lo identifique en la caché.")
     source = Path(path)
     directory = directory or cache_dir()
     directory.mkdir(parents=True, exist_ok=True)
-    key = cache_key(source, cfg)
+    key = cache_key(source, cfg, variant)
     raw_path = directory / f"{key}.raw"
     meta_path = directory / f"{key}.json"
 
@@ -300,12 +314,17 @@ def prepare_clip(
         except (json.JSONDecodeError, OSError, TypeError, ValueError, KeyError):
             pass  # caché ilegible: se regenera
 
-    meta = _transcode(source, cfg, raw_path, meta_path, progress)
+    meta = _transcode(source, cfg, raw_path, meta_path, progress, transform)
     return ClipCache(raw_path, meta)
 
 
 def _transcode(
-    source: Path, cfg: VideoConfig, raw_path: Path, meta_path: Path, progress: ProgressFn | None
+    source: Path,
+    cfg: VideoConfig,
+    raw_path: Path,
+    meta_path: Path,
+    progress: ProgressFn | None,
+    transform: "Callable[[np.ndarray], np.ndarray] | None" = None,
 ) -> ClipMeta:
     probe = probe_clip(source)
     bytes_per_frame = frame_bytes(cfg.width, cfg.height, cfg.pixel_format)
@@ -349,6 +368,8 @@ def _transcode(
                 )
                 if cfg.mirror:
                     fitted = cv2.flip(fitted, 1)
+                if transform is not None:
+                    fitted = transform(fitted)
                 fh.write(encode_frame(fitted, cfg.pixel_format).tobytes())
                 written += 1
                 if progress and (written % 15 == 0 or written == 1):
@@ -513,6 +534,7 @@ def prune_cache(keep: set[str] | None = None, *, directory: Path | None = None) 
             freed += raw.stat().st_size
             raw.unlink()
             meta.unlink(missing_ok=True)
+            raw.with_name(raw.stem + ".idx.npz").unlink(missing_ok=True)
         except OSError:
             continue
     return freed

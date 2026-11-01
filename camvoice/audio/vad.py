@@ -5,9 +5,12 @@ Dos backends, misma interfaz:
   * `EnergyDetector`  - RMS con piso de ruido adaptativo e histéresis de trama.
     Sin dependencias nativas, funciona en cualquier máquina y es el fallback.
   * `WebrtcDetector`  - WebRTC VAD (GMM sobre sub-bandas), mucho mejor
-    distinguiendo voz de ruido estacionario. Se le añade por delante la puerta
-    de energía del detector anterior, porque WebRTC a veces marca voz en ruido
-    muy bajo (micrófono silenciado o tapado).
+    distinguiendo voz de ruido estacionario. Una trama solo cuenta como voz si
+    WebRTC la marca **y** además supera la validación de energía: puerta
+    absoluta `gate_db` y SNR sobre el piso de ruido adaptativo con histéresis
+    (`snr_on_db` para entrar, `snr_off_db` para mantenerse). El piso de ruido
+    sube con el ambiente cuando la decisión combinada es «sin voz», así que un
+    ruido de fondo constante deja de superar el umbral.
 
 Ninguno transcribe ni interpreta el audio: solo responden "¿hay voz en estos
 20 ms?". La decisión temporal (entrar/salir de SPEAKING) vive en `gate.py`.
@@ -176,7 +179,11 @@ def webrtc_available() -> bool:
 
 
 class WebrtcDetector:
-    """WebRTC VAD con la puerta de energía por delante.
+    """WebRTC VAD validado por energía y SNR adaptativa.
+
+    Voz = WebRTC dice voz Y nivel ≥ `gate_db` Y SNR ≥ `snr_on_db` (o ≥
+    `snr_off_db` si la trama anterior ya era voz). La histéresis y el piso de
+    ruido del detector de energía siguen la decisión combinada.
 
     Requiere tramas de 10, 20 o 30 ms de int16 mono a 8/16/32/48 kHz.
     """
@@ -205,6 +212,7 @@ class WebrtcDetector:
     def process(self, frame: np.ndarray) -> FrameDecision:
         energy = self._energy.process(frame)
         if energy.calibrating or energy.rms_db < self.cfg.gate_db:
+            self._energy._voiced = False
             return FrameDecision(
                 False, energy.rms_db, energy.noise_floor_db, self.name,
                 energy.calibrating, energy.signal_lost,
@@ -216,7 +224,13 @@ class WebrtcDetector:
                 f"Se esperaban {self.expected_samples} muestras por trama "
                 f"({self.frame_ms} ms a {self.samplerate} Hz), llegaron {data.size}."
             )
-        voiced = bool(self._vad.is_speech(data.tobytes(), self.samplerate))
+        speech = bool(self._vad.is_speech(data.tobytes(), self.samplerate))
+        # `energy.voiced` ya aplica la SNR con histéresis respecto a la decisión
+        # combinada anterior (snr_on para entrar, snr_off para mantenerse).
+        voiced = speech and energy.voiced
+        # El piso de ruido y la histéresis siguen la decisión combinada: un
+        # sonido que WebRTC no confirma como voz cuenta como ambiente.
+        self._energy._voiced = voiced
         return FrameDecision(
             voiced, energy.rms_db, energy.noise_floor_db, self.name, False, False
         )

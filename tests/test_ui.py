@@ -54,7 +54,7 @@ def test_la_ventana_se_construye(window):
 def test_estan_todas_las_pestanas(window):
     nombres = [window.tabs.tabText(i) for i in range(window.tabs.count())]
     assert nombres == [
-        "Videos", "Grabar", "Micrófono", "Detector", "Efectos", "Salida",
+        "Videos", "Grabar", "Gestos", "Biblioteca", "Micrófono", "Detector", "Efectos", "Salida",
     ]
 
 
@@ -402,3 +402,279 @@ def test_el_clip_de_silencio_no_muestra_frases(window):
     rec = window.recorder_tab
     rec.kind_combo.setCurrentIndex(1)
     assert rec._current_plan().reading_phrases() == []
+
+
+# --------------------------------------------------------------------------- #
+# Gestos, biblioteca, indicador de video pregrabado
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def gesture_clip(tmp_path):
+    from camvoice.testclips import make_test_clips
+
+    _, sil = make_test_clips(tmp_path / "g", width=64, height=48, fps=10, seconds=1.0)
+    return str(sil)
+
+
+def test_pestana_gestos_tiene_un_boton_por_gesto(window):
+    from camvoice.gestures import GESTURES
+
+    tab = window.gestures_tab
+    assert set(tab.buttons) == set(GESTURES)
+    # Sin sesión en marcha, los botones están desactivados.
+    window._refresh()
+    assert not any(b.isEnabled() for b in tab.buttons.values())
+    assert "Inicia la cámara" in tab.status_label.text()
+
+
+def test_asignar_clip_de_gesto_lo_guarda_en_el_manifiesto(window, gesture_clip):
+    from camvoice.video.library import load_library
+
+    tab = window.gestures_tab
+    tab._pick_file = lambda *_: gesture_clip
+    assert tab.assign_clip("saludar")
+    lib = load_library(window.cfg).library
+    assert lib.active_gestures()["saludar"].clip == gesture_clip
+    assert tab.clip_labels["saludar"].text().endswith(".mp4")
+    assert "saludar" in tab.wanted_hotkeys()
+
+
+def test_clip_de_gesto_ilegible_no_se_guarda(window, tmp_path):
+    malo = tmp_path / "malo.mp4"
+    malo.write_bytes(b"no es video")
+    tab = window.gestures_tab
+    tab._pick_file = lambda *_: str(malo)
+    assert not tab.assign_clip("sonreir")
+    assert "sonreir" not in tab.library.gestures
+
+
+def test_atajos_invalidos_no_se_guardan(window, gesture_clip):
+    tab = window.gestures_tab
+    tab._pick_file = lambda *_: gesture_clip
+    tab.assign_clip("saludar")
+    tab.hotkey_edits["saludar"].setText("Ctrl+Shift+M")
+    assert not tab.save_hotkeys()
+    assert "Teams" in tab.form_message.text()
+    tab.hotkey_edits["saludar"].setText("Ctrl+Alt+F12")  # choca con cancelar
+    assert not tab.save_hotkeys()
+    assert "Cancelar gesto" in tab.form_message.text()
+
+
+def test_atajos_validos_se_guardan_normalizados(window, gesture_clip):
+    from camvoice.video.library import load_library
+
+    tab = window.gestures_tab
+    tab._pick_file = lambda *_: gesture_clip
+    tab.assign_clip("saludar")
+    tab.hotkey_edits["saludar"].setText("ctrl+alt+f9")
+    assert tab.save_hotkeys()
+    assert load_library(window.cfg).library.gestures["saludar"].hotkey == "Ctrl+Alt+F9"
+    assert tab.hotkey_edits["saludar"].text() == "Ctrl+Alt+F9"
+
+
+def test_suspender_atajos_actualiza_la_configuracion(window):
+    window.gestures_tab.hotkeys_check.setChecked(False)
+    assert window.cfg.gestures.hotkeys_enabled is False
+    assert window.hotkeys.suspended
+    window.gestures_tab.set_hotkeys_enabled(True)
+    assert window.cfg.gestures.hotkeys_enabled is True
+    assert not window.hotkeys.suspended
+
+
+def test_gesto_sin_sesion_avisa_y_no_falla(window):
+    window._on_gesture("saludar")
+    assert "Inicia la cámara" in window.statusBar().currentMessage()
+
+
+def test_indicador_de_video_pregrabado_visible_al_correr(window):
+    window._set_running(True)
+    assert not window.prerecorded_indicator.isHidden()
+    assert "PREGRABADO" in window.prerecorded_indicator.text()
+    window._set_running(False)
+    assert window.prerecorded_indicator.isHidden()
+
+
+def test_modo_de_reproduccion_se_guarda_y_no_hay_rotulo(window, tmp_path):
+    # Requisito de salida limpia: ya no existe la opción de rotular la imagen;
+    # el aviso de video pregrabado vive solo en la interfaz local.
+    assert not hasattr(window, "label_check")
+    window.playback_combo.setCurrentIndex(window.playback_combo.findData("classic"))
+    window.normalize_check.setChecked(False)
+    window._on_save()
+    cfg = AppConfig.load(tmp_path / "config.json")
+    assert not hasattr(cfg.output, "prerecorded_label")
+    assert cfg.video.playback == "classic"
+    assert cfg.video.normalize_clips is False
+
+
+def test_modo_y_biblioteca_se_bloquean_al_correr(window):
+    window._set_running(True)
+    assert not window.playback_combo.isEnabled()
+    assert not any(b.isEnabled() for b in window.pool_buttons)
+    window._set_running(False)
+    assert window.playback_combo.isEnabled()
+
+
+def test_clips_extra_van_al_manifiesto(window, gesture_clip):
+    from camvoice.video.library import load_library
+
+    window.add_pool_path("silent", gesture_clip)
+    window.add_pool_path("silent", gesture_clip)  # sin duplicar
+    assert load_library(window.cfg).library.silent == [gesture_clip]
+    assert window.pool_lists["silent"].count() == 1
+    window.pool_lists["silent"].setCurrentRow(0)
+    window._remove_pool_clip("silent")
+    assert load_library(window.cfg).library.silent == []
+    assert window.pool_lists["silent"].count() == 0
+
+
+def test_preajuste_conversacion_cambia_los_tiempos(window):
+    combo_ = window.vad_preset
+    combo_.setCurrentIndex(combo_.findData("Conversación (respuestas cortas)"))
+    assert window.cfg.vad.attack_ms == 80
+    assert window.cfg.vad.release_ms == 700
+    assert window.attack.value() == pytest.approx(80)
+
+
+def test_insignias_de_estado_nuevas():
+    from camvoice.ui.widgets import state_badge_style
+
+    assert state_badge_style("GESTURE")[0] == "Gesto"
+    assert "Degradado" in state_badge_style("DEGRADED")[0]
+
+
+def test_menu_de_gestos_en_la_bandeja(qt_app):
+    from camvoice.ui.tray import TrayController
+
+    pedidos, conmutados = [], []
+    tray = TrayController(
+        on_show=lambda: None, on_start=lambda: None, on_stop=lambda: None,
+        on_quit=lambda: None, on_gesture=pedidos.append,
+        on_hotkeys_toggled=conmutados.append,
+    )
+    textos = [a.text() for a in tray.gestures_menu.actions() if a.text()]
+    assert any("Sin gestos" in t for t in textos)
+
+    tray.set_gestures(("saludar", "asentir"), enabled=True, hotkeys={"saludar": "Ctrl+Alt+F1"})
+    acciones = {a.text().split("\t")[0]: a for a in tray.gestures_menu.actions() if a.text()}
+    assert "Saludar" in acciones and "Cancelar gesto" in acciones
+    acciones["Saludar"].trigger()
+    acciones["Cancelar gesto"].trigger()
+    assert pedidos == ["saludar", "neutro"]
+
+    tray.hotkeys_action.setChecked(False)
+    assert conmutados == [False]
+    tray.set_hotkeys_checked(True)  # reflejo sin eco
+    assert conmutados == [False]
+    tray.update_state("GESTURE", running=True)
+    tray.hide()
+
+
+def test_bandeja_ofrece_pausa_y_la_indica(qt_app):
+    from camvoice.ui.tray import TrayController
+
+    pedidos = []
+    tray = TrayController(
+        on_show=lambda: None, on_start=lambda: None, on_stop=lambda: None,
+        on_quit=lambda: None, on_gesture=pedidos.append,
+        on_hotkeys_toggled=lambda _on: None,
+    )
+    tray.set_gestures(("saludar",), enabled=True)
+    acciones = {a.text().split("\t")[0]: a for a in tray.gestures_menu.actions() if a.text()}
+    assert "Pausar / reanudar video" in acciones
+    acciones["Pausar / reanudar video"].trigger()
+    assert pedidos == ["pausa"]
+    tray.update_state("VIDEO_PAUSED", running=True)
+    assert "pausa" in tray.icon.toolTip().lower()
+    tray.hide()
+
+
+def test_pestana_gestos_boton_y_atajo_de_pausa(window, tmp_path):
+    from camvoice.gestures import PAUSE
+
+    tab = window.gestures_tab
+    assert tab.pause_edit.text() == "Ctrl+Alt+F11"
+    assert tab.wanted_hotkeys()[PAUSE] == "Ctrl+Alt+F11"
+    tab.update_status(running=True, mode="director", available=("saludar",), paused=True)
+    assert tab.pause_button.isEnabled()
+    assert tab.pause_button.text() == "Reanudar video"
+    assert "pausa" in tab.status_label.text().lower()
+    assert not any(b.isEnabled() for b in tab.buttons.values())
+    tab.update_status(running=True, mode="director", available=("saludar",), paused=False)
+    assert tab.pause_button.text() != "Reanudar video"
+    tab.pause_edit.setText("ctrl+alt+f10")
+    assert tab.save_hotkeys()
+    assert window.cfg.gestures.pause_hotkey == "Ctrl+Alt+F10"
+
+
+def test_pausa_sin_sesion_avisa_y_el_indicador_se_oculta(window):
+    window._on_gesture("pausa")
+    assert "Inicia la cámara" in window.statusBar().currentMessage()
+    assert window.paused_indicator.isHidden()
+    window._set_running(True)
+    window._set_running(False)
+    assert window.paused_indicator.isHidden()
+
+
+# --------------------------------------------------------------------------- #
+# Grabar gestos y clips largos
+# --------------------------------------------------------------------------- #
+
+
+def test_el_selector_de_grabacion_incluye_gestos_y_largos(window):
+    from camvoice.gestures import GESTURES
+
+    rec = window.recorder_tab
+    claves = [rec.kind_combo.itemData(i) for i in range(rec.kind_combo.count())]
+    assert claves[:4] == ["speaking", "silent", "silent_extra", "speaking_extra"]
+    assert {f"gesture:{g}" for g in GESTURES} <= set(claves)
+
+
+def test_el_rango_de_duracion_depende_del_tipo(window):
+    rec = window.recorder_tab
+    combo = rec.kind_combo
+    combo.setCurrentIndex(combo.findData("silent_extra"))
+    assert rec.duration.slider.maximum() >= 120
+    assert rec._current_plan().duration_s == pytest.approx(90)
+    combo.setCurrentIndex(combo.findData("gesture:saludar"))
+    assert rec.duration.slider.maximum() <= 6
+    plan = rec._current_plan()
+    assert plan.kind == "gesture" and plan.gesture == "saludar"
+    combo.setCurrentIndex(combo.findData("speaking"))
+    assert rec._current_plan().duration_s == pytest.approx(15)
+
+
+def test_un_gesto_grabado_se_asigna_a_la_biblioteca(window, gesture_clip):
+    from camvoice.video.library import load_library
+
+    window._on_clip_recorded("gesture:sonreir", gesture_clip)
+    assert load_library(window.cfg).library.gestures["sonreir"].clip == gesture_clip
+    assert window.tabs.tabText(window.tabs.currentIndex()) == "Gestos"
+
+
+def test_un_clip_largo_grabado_se_anade_al_grupo(window, gesture_clip):
+    from camvoice.video.library import load_library
+
+    window._on_clip_recorded("silent_extra", gesture_clip)
+    window._on_clip_recorded("speaking_extra", gesture_clip)
+    lib = load_library(window.cfg).library
+    assert lib.silent == [gesture_clip] and lib.speaking == [gesture_clip]
+    assert window.pool_lists["silent"].count() == 1
+
+
+def test_la_silueta_de_referencia_usa_el_clip_en_silencio(window, gesture_clip):
+    import numpy as np
+
+    rec = window.recorder_tab
+    frame = np.zeros((48, 64, 3), np.uint8)
+    assert rec.reference_frame() is None
+    window.cfg.video.silent_clip = gesture_clip
+    assert rec.reference_frame() is not None
+    con = rec.preview_image(frame, guias=True)
+    rec.ghost_check.setChecked(False)
+    sin = rec.preview_image(frame, guias=True)
+    assert con.mean() > sin.mean()
+    # Grabando (sin guías) nunca se superpone nada.
+    rec.ghost_check.setChecked(True)
+    assert rec.preview_image(frame, guias=False) is frame

@@ -31,3 +31,18 @@ instalacion/diagnostico-*.txt
 # NOTA: vendor/filters/*.dll SÍ se versiona a propósito.
 # Son el filtro de cámara virtual (MIT, 326 KB en total) y sin ellas la
 # aplicación no puede registrarse como cámara. Ver vendor/filters/ATRIBUCION.md
+
+# Grabaciones personales y derivados: NUNCA se versionan (privacidad).
+# La biblioteca importada vive en CAMVOICE_HOME, fuera del repo.
+*.mp4
+*.mov
+*.avi
+*.mkv
+*.webm
+*.m4v
+*.wmv
+*.npz
+*.idx.npz
+library/
+thumbs/
+probe_cache.json

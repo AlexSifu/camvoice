@@ -16,6 +16,8 @@ def isolated_home(tmp_path_factory, monkeypatch):
     """Aísla la configuración y la caché de la instalación real del usuario."""
     home = tmp_path_factory.mktemp("camvoice-home")
     monkeypatch.setenv("CAMVOICE_HOME", str(home))
+    # Las pruebas de la ventana no deben registrar atajos globales reales.
+    monkeypatch.setenv("CAMVOICE_NO_GLOBAL_HOTKEYS", "1")
     return home
 
 

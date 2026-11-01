@@ -16,6 +16,7 @@ import numpy as np
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QFrame,
@@ -29,18 +30,83 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..gestures import GESTURES, gesture_label
 from ..record import (
+    LONG_SILENT_PLAN,
+    LONG_SPEAKING_PLAN,
     SILENT_PLAN,
     SPEAKING_PLAN,
     CameraInfo,
     ClipRecorder,
     RecordingPlan,
     draw_framing_guides,
+    draw_reference_ghost,
+    first_frame,
+    gesture_plan,
     list_cameras,
 )
 from .widgets import Card, PercentSlider, combo, labelled_row
 
-__all__ = ["RecorderTab"]
+__all__ = ["RecorderTab", "RECORD_KINDS", "plan_for", "suggested_filename"]
+
+
+RECORD_KINDS: list[tuple[str, str]] = [
+    ("Clip HABLANDO (principal)", "speaking"),
+    ("Clip EN SILENCIO (principal)", "silent"),
+    ("Silencio LARGO (extra, reuniones largas)", "silent_extra"),
+    ("Habla LARGA (extra, reuniones largas)", "speaking_extra"),
+    *[(f"Gesto: {gesture_label(g)}", f"gesture:{g}") for g in GESTURES],
+]
+"""(texto, clave) del selector. La clave es lo que recibe `on_clip_recorded`."""
+
+DURATION_RANGES: dict[str, tuple[float, float, float]] = {
+    "speaking": (8, 25, 15),
+    "silent": (8, 25, 15),
+    "silent_extra": (30, 180, 90),
+    "speaking_extra": (20, 120, 60),
+    "gesture": (2, 6, 3),
+}
+"""(mínimo, máximo, por defecto) en segundos para cada tipo."""
+
+
+def _family(key: str) -> str:
+    return "gesture" if key.startswith("gesture:") else key
+
+
+def plan_for(key: str, duration_s: float) -> RecordingPlan:
+    """Plan de grabación para una clave de RECORD_KINDS."""
+    if key.startswith("gesture:"):
+        return gesture_plan(key.split(":", 1)[1], duration_s)
+    base = {
+        "speaking": SPEAKING_PLAN,
+        "silent": SILENT_PLAN,
+        "silent_extra": LONG_SILENT_PLAN,
+        "speaking_extra": LONG_SPEAKING_PLAN,
+    }[key]
+    return base.with_duration(duration_s)
+
+
+def suggested_filename(key: str) -> str:
+    if key.startswith("gesture:"):
+        return f"gesto_{key.split(':', 1)[1]}.mp4"
+    return {
+        "speaking": "hablando.mp4",
+        "silent": "silencio.mp4",
+        "silent_extra": "silencio_largo.mp4",
+        "speaking_extra": "habla_larga.mp4",
+    }[key]
+
+
+def describe_use(key: str) -> str:
+    """Cómo se usará el clip, para la pregunta final."""
+    if key.startswith("gesture:"):
+        return f"como clip del gesto «{gesture_label(key.split(':', 1)[1])}»"
+    return {
+        "speaking": "como clip principal hablando",
+        "silent": "como clip principal en silencio",
+        "silent_extra": "añadiéndolo a los silencios extra",
+        "speaking_extra": "añadiéndolo a las hablas extra",
+    }[key]
 
 
 def _no_impone_ancho(etiqueta: QLabel) -> QLabel:
@@ -62,9 +128,14 @@ def _no_impone_ancho(etiqueta: QLabel) -> QLabel:
 class RecorderTab(QWidget):
     """Graba los dos clips sin salir de la aplicación."""
 
-    def __init__(self, on_clip_recorded) -> None:  # noqa: ANN001
+    def __init__(self, on_clip_recorded, reference_clip=None) -> None:  # noqa: ANN001
+        """`reference_clip()` devuelve la ruta del clip cuya primera imagen
+        sirve de pose de referencia (el silencio principal), o None."""
         super().__init__()
         self._on_clip_recorded = on_clip_recorded
+        self._reference_clip = reference_clip or (lambda: None)
+        self._reference: tuple[str, np.ndarray | None] = ("", None)
+        self._record_key = "speaking"
         self._cameras: list[CameraInfo] = []
         self._recorder: ClipRecorder | None = None
         self._plan: RecordingPlan = SPEAKING_PLAN
@@ -161,9 +232,7 @@ class RecorderTab(QWidget):
 
         # --- qué grabar ------------------------------------------------ #
         ajustes = Card("qué grabar")
-        self.kind_combo = combo(
-            [("Clip HABLANDO", "speaking"), ("Clip EN SILENCIO", "silent")]
-        )
+        self.kind_combo = combo(RECORD_KINDS)
         self.kind_combo.currentIndexChanged.connect(self._on_kind_changed)
         ajustes.add(labelled_row("Clip", self.kind_combo))
 
@@ -174,6 +243,15 @@ class RecorderTab(QWidget):
         )
         self.duration.bind(lambda _v: self._on_kind_changed())
         ajustes.add(self.duration)
+
+        self.ghost_check = QCheckBox("Mostrar la pose de referencia (silueta del clip en silencio)")
+        self.ghost_check.setToolTip(
+            "Superpone, semitransparente, la primera imagen del clip en silencio "
+            "principal sobre la vista previa para que te coloques igual. Solo se "
+            "ve aquí: no se graba."
+        )
+        self.ghost_check.setChecked(True)
+        ajustes.add(self.ghost_check)
 
         self.countdown = PercentSlider(
             "Cuenta atrás", minimo=0, maximo=15, defecto=3, sufijo=" s",
@@ -227,10 +305,18 @@ class RecorderTab(QWidget):
         )
 
     def _current_plan(self) -> RecordingPlan:
-        base = SPEAKING_PLAN if self.kind_combo.currentData() == "speaking" else SILENT_PLAN
-        return base.with_duration(self.duration.value())
+        return plan_for(self.kind_combo.currentData(), self.duration.value())
+
+    def _sync_duration_range(self) -> None:
+        familia = _family(self.kind_combo.currentData())
+        if getattr(self, "_duration_family", None) == familia:
+            return
+        self._duration_family = familia
+        minimo, maximo, defecto = DURATION_RANGES[familia]
+        self.duration.set_range(minimo, maximo, defecto)
 
     def _on_kind_changed(self) -> None:
+        self._sync_duration_range()
         self._plan = self._current_plan()
         self.checklist.setText(
             "Recuerda:  " + "   ·   ".join(self._plan.checklist)
@@ -279,7 +365,8 @@ class RecorderTab(QWidget):
             return
 
         self._plan = self._current_plan()
-        sugerido = "hablando.mp4" if self._plan.kind == "speaking" else "silencio.mp4"
+        self._record_key = self.kind_combo.currentData()
+        sugerido = suggested_filename(self._record_key)
         ruta, _ = QFileDialog.getSaveFileName(
             self, f"Guardar {self._plan.name}", sugerido, "Video MP4 (*.mp4)"
         )
@@ -354,7 +441,7 @@ class RecorderTab(QWidget):
             self._style_cue(False)
             self.progress.setValue(1000)
             self.progress.setFormat("completado")
-            ruta, kind = estado.output_path, self._plan.kind
+            ruta, kind = estado.output_path, self._record_key
             self._recorder = None
             self._finish()
             self._offer_use(Path(ruta), kind, estado.measured_fps)
@@ -368,8 +455,22 @@ class RecorderTab(QWidget):
             self._finish()
             QMessageBox.critical(self, "Error al grabar", estado.error)
 
+    def reference_frame(self) -> np.ndarray | None:
+        """Primera imagen del clip de referencia; se relee si cambia la ruta."""
+        ruta = self._reference_clip() or ""
+        if ruta != self._reference[0]:
+            self._reference = (ruta, first_frame(ruta) if ruta else None)
+        return self._reference[1]
+
+    def preview_image(self, frame: np.ndarray, *, guias: bool) -> np.ndarray:
+        """Lo que se pinta en la vista previa (nunca lo que se graba)."""
+        vista = frame
+        if guias and self.ghost_check.isChecked():
+            vista = draw_reference_ghost(vista, self.reference_frame())
+        return draw_framing_guides(vista) if guias else vista
+
     def _show_frame(self, frame: np.ndarray, *, guias: bool) -> None:
-        vista = draw_framing_guides(frame) if guias else frame
+        vista = self.preview_image(frame, guias=guias)
         alto, ancho = vista.shape[:2]
         imagen = QImage(
             np.ascontiguousarray(vista).data, ancho, alto, 3 * ancho,
@@ -388,11 +489,10 @@ class RecorderTab(QWidget):
                 "pasar con poca luz: la webcam baja la cadencia para exponer "
                 "más. Con más luz el clip quedará más fluido."
             )
-        etiqueta = "hablando" if kind == "speaking" else "en silencio"
         respuesta = QMessageBox.question(
             self,
             "Grabación terminada",
-            f"Guardado en:\n{ruta}\n\n¿Usarlo como clip {etiqueta}?{aviso}",
+            f"Guardado en:\n{ruta}\n\n¿Usarlo {describe_use(kind)}?{aviso}",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
         )

@@ -190,6 +190,9 @@ STATE_COLORS = {
     "SILENT": ("Silencio", "#1d2b3a", "#9fc5e8"),
     "SPEAKING": ("Voz detectada", "#14301f", "#56d364"),
     "TRANSITION": ("Transición", "#332a12", "#e3b341"),
+    "GESTURE": ("Gesto", "#2a1f3d", "#d2a8ff"),
+    "DEGRADED": ("Degradado: clip con fallos", "#3a1f22", "#ffb3b8"),
+    "VIDEO_PAUSED": ("Vídeo en pausa (imagen congelada)", "#2b2b2b", "#f0f0f0"),
     "-": ("Detenido", COLORS["surface_alt"], COLORS["text_dim"]),
 }
 
@@ -312,6 +315,16 @@ class PercentSlider(QWidget):
 
     def set_value(self, valor: float) -> None:
         self.slider.setValue(int(round(valor * self._escala)))
+
+    def set_range(self, minimo: float, maximo: float, defecto: float) -> None:
+        """Cambia los límites y el valor por defecto; recoloca el valor actual."""
+        self._defecto = defecto
+        self._reset.setToolTip(f"Volver a {defecto:g}{self._sufijo}")
+        anterior = self.slider.blockSignals(True)
+        self.slider.setRange(int(minimo * self._escala), int(maximo * self._escala))
+        self.slider.setValue(int(round(defecto * self._escala)))
+        self.slider.blockSignals(anterior)
+        self._refresh_label()
 
     def set_silently(self, valor: float) -> None:
         """Cambia el valor sin emitir la señal, para cargar la configuración."""

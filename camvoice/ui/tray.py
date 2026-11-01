@@ -35,6 +35,9 @@ STATE_COLORS = {
     "SILENT": ("#4a6b8a", "Silencio"),
     "SPEAKING": ("#3fb950", "Voz detectada"),
     "TRANSITION": ("#d29922", "Transición"),
+    "GESTURE": ("#a371f7", "Gesto"),
+    "DEGRADED": ("#f85149", "Degradado (clip con fallos)"),
+    "VIDEO_PAUSED": ("#8b949e", "Vídeo en pausa (imagen congelada)"),
     "-": ("#6e7681", "Detenido"),
 }
 
@@ -80,9 +83,15 @@ class TrayController:
         on_start: Callable[[], None],
         on_stop: Callable[[], None],
         on_quit: Callable[[], None],
+        on_gesture: Callable[[str], None] | None = None,
+        on_hotkeys_toggled: Callable[[bool], None] | None = None,
+        on_speech_toggled: Callable[[], None] | None = None,
         parent=None,  # noqa: ANN001
     ) -> None:
         self._on_show = on_show
+        self._on_gesture = on_gesture
+        self._on_hotkeys_toggled = on_hotkeys_toggled
+        self._on_speech_toggled = on_speech_toggled
         self._on_start = on_start
         self._on_stop = on_stop
 
@@ -108,6 +117,27 @@ class TrayController:
         self._detener.setEnabled(False)
         menu.addAction(self._detener)
 
+        # Gestos: con el ratón desde la bandeja, sin abrir la ventana.
+        self.gestures_menu = QMenu("Gestos", menu)
+        menu.addMenu(self.gestures_menu)
+        self.hotkeys_action = QAction("Atajos de teclado activos", menu)
+        self.hotkeys_action.setCheckable(True)
+        self.hotkeys_action.setChecked(True)
+        self.hotkeys_action.toggled.connect(self._hotkeys_toggled)
+        self._gesture_names: tuple[str, ...] = ()
+        self.set_gestures((), enabled=False)
+
+        # Control de habla: estado inequívoco y, en modo manual, el interruptor.
+        menu.addSeparator()
+        self.speech_state_action = QAction("Habla: BLOQUEADA", menu)
+        self.speech_state_action.setEnabled(False)
+        menu.addAction(self.speech_state_action)
+        self.speech_toggle_action = QAction("Autorizar habla (modo manual)", menu)
+        self.speech_toggle_action.setEnabled(False)
+        self.speech_toggle_action.triggered.connect(lambda _=False: self._speech_toggle())
+        menu.addAction(self.speech_toggle_action)
+        self._speech_key: tuple = ()
+
         menu.addSeparator()
         salir = QAction("Salir", menu)
         salir.triggered.connect(lambda: on_quit())
@@ -125,6 +155,84 @@ class TrayController:
         # consume el menú contextual, así que no llega aquí.
         if razon in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
             self._on_show()
+
+    def _hotkeys_toggled(self, on: bool) -> None:
+        if self._on_hotkeys_toggled is not None:
+            self._on_hotkeys_toggled(bool(on))
+
+    def set_hotkeys_checked(self, on: bool) -> None:
+        """Refleja el estado sin volver a avisar (evita el eco)."""
+        prev = self.hotkeys_action.blockSignals(True)
+        self.hotkeys_action.setChecked(bool(on))
+        self.hotkeys_action.blockSignals(prev)
+
+    def set_gestures(self, names, *, enabled: bool, hotkeys: dict[str, str] | None = None) -> None:  # noqa: ANN001
+        """Reconstruye el submenú Gestos solo si cambió la lista."""
+        from ..gestures import CANCEL, PAUSE, gesture_label
+
+        names = tuple(names)
+        clave = (names, bool(enabled), tuple(sorted((hotkeys or {}).items())))
+        if getattr(self, "_gestures_key", None) == clave:
+            return
+        self._gestures_key = clave
+        menu = self.gestures_menu
+        menu.clear()
+        if not names or not enabled:
+            vacio = QAction(
+                "Sin gestos (inicia en modo director con clips de gesto)" if not names
+                else "Inicia la cámara para usar gestos",
+                menu,
+            )
+            vacio.setEnabled(False)
+            menu.addAction(vacio)
+        else:
+            for name in names:
+                texto = gesture_label(name)
+                if hotkeys and hotkeys.get(name):
+                    texto += f"	{hotkeys[name]}"
+                accion = QAction(texto, menu)
+                accion.triggered.connect(lambda _=False, n=name: self._gesture(n))
+                menu.addAction(accion)
+            menu.addSeparator()
+            cancelar = QAction(gesture_label(CANCEL), menu)
+            cancelar.triggered.connect(lambda _=False: self._gesture(CANCEL))
+            menu.addAction(cancelar)
+        if enabled:
+            pausa = QAction(gesture_label(PAUSE), menu)
+            pausa.setToolTip("Congela la última imagen; se indica en la ventana y aquí.")
+            pausa.triggered.connect(lambda _=False: self._gesture(PAUSE))
+            menu.addAction(pausa)
+        menu.addSeparator()
+        menu.addAction(self.hotkeys_action)
+        self._gesture_names = names
+
+    def _gesture(self, name: str) -> None:
+        if self._on_gesture is not None:
+            self._on_gesture(name)
+
+    def _speech_toggle(self) -> None:
+        if self._on_speech_toggled is not None:
+            self._on_speech_toggled()
+
+    def update_speech(self, auth, *, running: bool) -> None:  # noqa: ANN001 - SpeechAuthorization | None
+        """Refleja la autorización de habla en el menú (solo si cambió)."""
+        if auth is None:
+            key: tuple = ("none", running)
+            texto, toggle_text, toggle_on = "Habla: BLOQUEADA (sin sesión)", "Autorizar habla (modo manual)", False
+        else:
+            manual = auth.mode == "manual"
+            key = (auth.allowed, auth.reason, auth.mode, auth.manual_allowed, running)
+            texto = f"Habla: {auth.label} — {auth.reason}"
+            toggle_text = "Bloquear habla" if auth.manual_allowed else "Autorizar habla"
+            if not manual:
+                toggle_text += " (solo en modo manual)"
+            toggle_on = manual and running
+        if key == self._speech_key:
+            return
+        self._speech_key = key
+        self.speech_state_action.setText(texto)
+        self.speech_toggle_action.setText(toggle_text)
+        self.speech_toggle_action.setEnabled(toggle_on)
 
     def show(self) -> None:
         self.icon.show()
@@ -148,9 +256,11 @@ class TrayController:
 
         _, etiqueta = STATE_COLORS.get(clave, STATE_COLORS["-"])
         self._estado_action.setText(etiqueta)
+        habla = self.speech_state_action.text() if running else ""
         self.icon.setToolTip(
             f"Cámara virtual por voz — {etiqueta.lower()}"
             + (f"\n{detail}" if detail else "")
+            + (f"\n{habla}" if habla else "")
         )
         self._iniciar.setEnabled(not running)
         self._detener.setEnabled(running)

@@ -57,6 +57,14 @@ def _apply_overrides(cfg: AppConfig, args: argparse.Namespace) -> None:
         v.loop_mode = args.loop_mode
     if getattr(args, "pixel_format", None):
         v.pixel_format = args.pixel_format
+    if getattr(args, "playback", None):
+        v.playback = args.playback
+    if getattr(args, "seed", None) is not None:
+        v.seed = args.seed
+    if getattr(args, "manifest", None):
+        v.library_manifest = str(Path(args.manifest).expanduser().resolve())
+    if getattr(args, "no_normalize", False):
+        v.normalize_clips = False
     if getattr(args, "mic", None) is not None:
         a.device = args.mic
         a.device_name = ""
@@ -686,7 +694,8 @@ def cmd_vad_test(args: argparse.Namespace) -> int:
                 f"{t:7.2f}  {s.state.value:<9} "
                 f"{'voz' if s.voiced else 'silencio':<7} "
                 f"{s.rms_db:7.1f} {s.noise_floor_db:7.1f} {s.snr_db:6.1f}  {_bar(s.rms_db)}"
-                + ("  calibrando" if s.calibrating else ""),
+                + ("  calibrando" if s.calibrating else "")
+                + (f"  eco:{s.echo_state}" if s.echo_state in ("echo", "double") else ""),
             )
             time.sleep(args.interval)
     except KeyboardInterrupt:
@@ -703,6 +712,13 @@ def cmd_vad_test(args: argparse.Namespace) -> int:
         + (f" (remuestreado desde {status.resampled_from} Hz)" if status.resampled_from != status.samplerate else "")
     )
     print(f"Tramas analizadas: {status.frames}   desbordes: {status.overflows}")
+    if status.echo_reference:
+        print(
+            f"Referencia de eco: {status.echo_reference}   "
+            f"tramas de voz vetadas por eco remoto: {status.echo_vetoes}"
+        )
+    else:
+        print(f"Referencia de eco: ninguna ({status.echo_reference_error or 'desactivada'})")
     print(f"Cambios de estado: {len(changes)}")
     for t, state in changes:
         print(f"  {t:6.2f} s -> {state}")
@@ -717,8 +733,93 @@ def cmd_vad_test(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_teams_test(args: argparse.Namespace) -> int:
+    """Muestra en vivo lo que CamVoice lee del micrófono de Teams (solo lectura).
+
+    Sirve para comprobar, con la versión instalada de Teams, si el botón de
+    micrófono expone `AutomationId = microphone-button` y qué etiqueta tiene
+    con el micrófono activo y silenciado. No pulsa nada ni cambia el mute.
+    """
+    from .meeting import MeetingState, TeamsUiaProvider, default_provider, state_label
+
+    cfg = _load(args)
+    provider = default_provider(
+        poll_ms=cfg.speech.teams_poll_ms, unmuted_expiry_ms=cfg.speech.unmuted_expiry_ms
+    )
+    if not isinstance(provider, TeamsUiaProvider):
+        print(f"{FAIL} {provider.snapshot().detail}")
+        return 1
+    provider.start()
+    print(
+        f"Leyendo Teams durante {args.duration:.0f} s (cada {provider.poll_ms} ms; "
+        f"UNMUTED caduca a los {provider.unmuted_expiry_ms} ms).\n"
+        "Silencia y reactiva el micrófono en Teams para ver los cambios.\n"
+    )
+    print(f"{'t (s)':>7}  {'estado':<11} {'edad':>7}  {'vent.':>5} {'bot.':>4} {'lect. ms':>8}  etiqueta / detalle")
+    started = time.perf_counter()
+    changes: list[tuple[float, str]] = []
+    previous = None
+    try:
+        while time.perf_counter() - started < args.duration:
+            s = provider.snapshot()
+            t = time.perf_counter() - started
+            if previous is None:
+                previous = s.state
+            elif s.state is not previous:
+                changes.append((t, s.state.value))
+                previous = s.state
+            edad = s.age_ms()
+            print(
+                f"{t:7.2f}  {s.state.value:<11} "
+                f"{(f'{edad:.0f}' if edad != float('inf') else '-'):>7}  "
+                f"{s.windows:>5} {s.buttons:>4} {s.read_ms:8.1f}  "
+                + (f"«{s.label}»" if s.label else "")
+                + (f" {s.detail}" if s.detail else "")
+            )
+            time.sleep(args.interval)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        provider.stop()
+
+    print(f"\nLecturas: {provider.reads}   exploraciones completas: {provider.rescans}   errores: {provider.errors}")
+    print(f"Cambios de estado: {len(changes)}")
+    for t, state in changes:
+        print(f"  {t:6.2f} s -> {state} ({state_label(MeetingState(state))})")
+    if not changes:
+        print("  (ninguno)")
+    if previous is MeetingState.NO_MEETING:
+        print(
+            f"\n{WARN} No se vio ninguna reunión. Si Teams estaba en una reunión, "
+            "su versión no expone el botón «microphone-button»: el modo automático "
+            "quedará bloqueado y conviene usar el control manual."
+        )
+    return 0
+
+
 def cmd_make_clips(args: argparse.Namespace) -> int:
-    from .testclips import make_test_clips
+    from .testclips import make_test_clips, make_test_library
+
+    if args.library:
+        lib = make_test_library(
+            Path(args.outdir),
+            width=args.width,
+            height=args.height,
+            fps=args.fps,
+            seconds=args.seconds,
+        )
+        print(f"{OK} clip de habla:     {lib['speaking']}")
+        print(f"{OK} clip de silencio:  {lib['silent']}")
+        print(f"{OK} silencio extra:    {lib['silent2']} (encuadre y luz distintos a propósito)")
+        for name, path in lib["gestures"].items():
+            print(f"{OK} gesto {name:<12} {path}")
+        print(f"{OK} manifiesto:        {lib['manifest']}")
+        print("\nPruébalos con:")
+        print(
+            f'  camvoice run --speaking "{lib["speaking"]}" --silent "{lib["silent"]}" '
+            f'--manifest "{lib["manifest"]}" --no-virtual-cam --duration 20'
+        )
+        return 0
 
     speaking, silent = make_test_clips(
         Path(args.outdir),
@@ -733,6 +834,345 @@ def cmd_make_clips(args: argparse.Namespace) -> int:
     print("Pruébalos con:")
     print(f'  camvoice run --speaking "{speaking}" --silent "{silent}"')
     return 0
+
+
+def _prepare_session(args: argparse.Namespace, cfg: AppConfig):  # noqa: ANN202
+    """Prepara clips (y en modo director, índices) mostrando el progreso."""
+    from .controller import Session, SessionError
+
+    session = Session(cfg)
+    last = [""]
+
+    def progress(done: int, total: int, message: str) -> None:
+        line = f"\r  {message[:44]:<44} {done:>6}/{max(total, done):<6}"
+        if line != last[0]:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            last[0] = line
+
+    try:
+        clips = session.prepare(
+            progress=progress,
+            force=getattr(args, "force", False),
+            load_to_ram=getattr(args, "ram", False),
+        )
+    except SessionError as exc:
+        print(f"\n{FAIL} {exc}")
+        session.close()
+        return None, None
+    print()
+    return session, clips
+
+
+def cmd_index(args: argparse.Namespace) -> int:
+    """Prepara cachés e índices del modo director y resume la biblioteca."""
+    cfg = _load(args)
+    cfg.video.playback = "director"
+    started = time.perf_counter()
+    session, clips = _prepare_session(args, cfg)
+    if session is None:
+        return 1
+    elapsed = time.perf_counter() - started
+    try:
+        print(f"Modo efectivo: {clips.mode}   ({elapsed:.1f} s)")
+        for title, pool in (("Silencio", clips.silent_pool), ("Habla", clips.speaking_pool)):
+            for c in pool:
+                idx = c.index
+                print(
+                    f"  {title:<9} {c.name:<28} {idx.frame_count:>6} fot.  d_ok {idx.d_ok:.3f}  "
+                    f"cara {'sí' if idx.face_found else 'no'}  rango boca {idx.mouth_range:.2f}"
+                )
+        for name, c in clips.gestures.items():
+            print(f"  Gesto     {name:<28} {c.index.frame_count:>6} fot.")
+        print(f"Caché total: {clips.total_mb:.0f} MB")
+        for w in clips.warnings:
+            print(f"{WARN} {w}")
+        return 0 if clips.mode == "director" else 2
+    finally:
+        session.close()
+
+
+def cmd_transitions(args: argparse.Namespace) -> int:
+    """Mide en los clips reales el coste y la espera de las transiciones."""
+    from .video.trials import measure
+
+    cfg = _load(args)
+    cfg.video.playback = "director"
+    session, clips = _prepare_session(args, cfg)
+    if session is None:
+        return 1
+    try:
+        if clips.mode != "director":
+            print(f"{FAIL} El modo director no está disponible: " + "; ".join(clips.warnings))
+            return 2
+        print(
+            f"Clips: {len(clips.silent_pool)} silencio, {len(clips.speaking_pool)} habla, "
+            f"{len(clips.gestures)} gestos/frases · {cfg.video.fps} FPS · "
+            f"{args.repeats} repeticiones por escenario (reloj simulado)"
+        )
+        started = time.perf_counter()
+        summary = measure(
+            cfg.video, clips.silent_pool, clips.speaking_pool, clips.gestures,
+            repeats=args.repeats, speaking_actions=sorted(clips.speaking_actions),
+            progress=_print_progress,
+        )
+        print()
+        for line in summary.lines():
+            print(line)
+        print(f"({time.perf_counter() - started:.1f} s)")
+        return 0
+    finally:
+        session.close()
+
+
+def _print_progress(done: int, total: int, text: str) -> None:
+    pct = 100.0 * done / total if total else 100.0
+    print(f"\r  {pct:5.1f} %  {text[:90]:<90}", end="", flush=True)
+
+
+def cmd_library(args: argparse.Namespace) -> int:
+    """Detecta, valida, importa o deshace la importación de las escenas numeradas."""
+    from .scenes import EXPECTED_COUNT, SKIPPED, scene_by_number
+
+    def scene_label(n: int) -> str:
+        s = scene_by_number(n)
+        return s.label if s else '?'
+    from .video.importer import (
+        STATUS_ERROR,
+        STATUS_LABELS,
+        STATUS_READY,
+        ImportCancelled,
+        default_source_folder,
+        import_library,
+        rollback_library,
+        scan_folder,
+        space_needed,
+        validate_scan,
+    )
+    from .video.library import manifest_path
+
+    cfg = _load(args)
+    path = manifest_path(cfg)
+    if args.rollback:
+        msg = rollback_library(cfg)
+        cfg.save(Path(args.config) if getattr(args, "config", None) else None)
+        print(f"{OK} {msg}")
+        return 0
+
+    folder = Path(args.folder).expanduser() if args.folder else default_source_folder()
+    try:
+        scan = scan_folder(folder)
+    except FileNotFoundError as exc:
+        print(f"{FAIL} {exc}")
+        return 1
+    print(f"Carpeta: {folder}")
+    print(f"  {scan.summary()}")
+    print(f"  Archivos ignorados (sin número o no son video): {len(scan.ignored)}")
+    if args.copy:
+        print(f"  Espacio necesario para copiar: {space_needed(scan) / 1e9:.2f} GB")
+    if not (args.validate or args.do_import):
+        for number, entry in sorted(scan.entries.items()):
+            names = ", ".join(p.name for p in entry.paths)
+            mark = FAIL if entry.ambiguous else OK
+            print(f"  {mark} {number:>2}  {scene_label(number):<34} {names}")
+        return 0 if len(scan.matched) == EXPECTED_COUNT and not scan.ambiguous else 2
+
+    started = time.perf_counter()
+    try:
+        probes = validate_scan(scan, path.parent, progress=_print_progress, force=args.force)
+        print()
+        counts = {s: 0 for s in STATUS_LABELS}
+        for number, info in sorted(probes.items()):
+            counts[info.status] = counts.get(info.status, 0) + 1
+            if info.status != STATUS_READY or info.issues:
+                mark = FAIL if info.status == STATUS_ERROR else WARN
+                print(f"  {mark} n.º {number:>2} {scene_label(number)}: " + "; ".join(info.issues))
+        print(
+            "  Validación: "
+            + ", ".join(f"{STATUS_LABELS[s]} {n}" for s, n in counts.items())
+            + f"   ({time.perf_counter() - started:.1f} s)"
+        )
+        if not args.do_import:
+            return 0 if counts.get(STATUS_ERROR, 0) == 0 else 2
+        lib, warnings = import_library(
+            cfg, scan, probes, copy=args.copy, apply_main_clips=not args.keep_main,
+            progress=_print_progress,
+        )
+        print()
+    except ImportCancelled as exc:
+        print(f"\n{WARN} {exc}")
+        return 130
+    cfg.save(Path(args.config) if getattr(args, "config", None) else None)
+    imported = sum(1 for e in lib.scenes.values() if e.status != STATUS_ERROR)
+    print(
+        f"{OK if imported == EXPECTED_COUNT else WARN} {imported}/{EXPECTED_COUNT} importadas "
+        f"(+{len(SKIPPED)} omitidas a propósito)   manifiesto: {path}"
+    )
+    for w in warnings:
+        print(f"  {WARN} {w}")
+    print(f"  Silencio principal: {cfg.video.silent_clip}")
+    print(f"  Habla principal:    {cfg.video.speaking_clip}")
+    print("  Siguiente paso: `camvoice index` (prepara cachés e índices).")
+    return 0 if imported == EXPECTED_COUNT else 2
+
+
+def cmd_gestures(args: argparse.Namespace) -> int:
+    """Lista, valida o asigna gestos del manifiesto."""
+    from .gestures import (
+        GESTURES,
+        SPEAKING_SUFFIX,
+        HotkeyError,
+        gesture_label,
+        is_known_gesture,
+        validate_hotkey,
+    )
+    from .video.library import load_library, manifest_path, save_library
+
+    cfg = _load(args)
+    loaded = load_library(cfg)
+    lib = loaded.library
+    path = manifest_path(cfg)
+
+    if args.set:
+        name, clip = args.set
+        if not is_known_gesture(name):
+            print(
+                f"{FAIL} Gesto desconocido «{name}». Válidos: {', '.join(GESTURES)} "
+                f"(o su variante «<gesto>{SPEAKING_SUFFIX}» para usarla mientras hablas)"
+            )
+            return 1
+        if not Path(clip).is_file():
+            print(f"{FAIL} No existe el clip {clip}")
+            return 1
+        if args.hotkey and name not in GESTURES:
+            print(f"{FAIL} Las variantes «{SPEAKING_SUFFIX}» no tienen atajo propio: usan el del gesto base.")
+            return 1
+        if args.hotkey:
+            try:
+                validate_hotkey(args.hotkey)
+            except HotkeyError as exc:
+                print(f"{FAIL} {exc}")
+                return 1
+        lib.set_gesture(name, str(Path(clip).resolve()), args.hotkey)
+        problems = lib.validate(check_files=True)
+        if problems:
+            for problem in problems:
+                print(f"{FAIL} {problem}")
+            return 1
+        save_library(lib, path)
+        print(f"{OK} «{gesture_label(name)}» -> {clip}   (guardado en {path})")
+        return 0
+
+    state = "existe" if loaded.exists else "no existe: solo se usan los clips principales"
+    print(f"Manifiesto: {path} ({state})")
+    print(f"Versión: {lib.version}")
+    silent, speaking = lib.pools(cfg)
+    for title, pool in (("silencio", silent), ("habla", speaking)):
+        print(f"Grupo de {title} ({len(pool)}):")
+        for clip_path in pool:
+            print(f"  {OK if Path(clip_path).is_file() else FAIL} {clip_path}")
+    keys = lib.hotkeys()
+    print("Gestos:")
+    for name in GESTURES:
+        entry = lib.gestures.get(name)
+        key = keys.get(name, "")
+        if entry is None or not entry.clip:
+            print(f"  {WARN} {gesture_label(name):<18} sin clip   {key}")
+            continue
+        ok = Path(entry.clip).is_file() and entry.enabled
+        extra = "" if entry.enabled else " (desactivado)"
+        print(f"  {OK if ok else FAIL} {gesture_label(name):<18} {Path(entry.clip).name}{extra}   {key}")
+    variants = sorted(n for n in lib.gestures if n.endswith(SPEAKING_SUFFIX))
+    if variants:
+        print("Variantes para usar mientras hablas:")
+        for name in variants:
+            entry = lib.gestures[name]
+            ok = bool(entry.clip) and Path(entry.clip).is_file() and entry.enabled
+            print(f"  {OK if ok else FAIL} {gesture_label(name):<28} {Path(entry.clip).name if entry.clip else '-'}")
+    print(f"Cancelar gesto: {cfg.gestures.cancel_hotkey}")
+    print(f"Pausar / reanudar video: {cfg.gestures.pause_hotkey}")
+    issues = list(loaded.issues) + lib.validate(check_files=True)
+    for issue in issues:
+        print(f"{WARN} {issue}")
+    return 0 if not issues else 2
+
+
+def cmd_soak(args: argparse.Namespace) -> int:
+    """Prueba de resistencia sin micrófono ni cámara (voz sintética)."""
+    from .soak import run_soak, simulate
+    from .video.director import Director
+
+    cfg = _load(args)
+    session, clips = _prepare_session(args, cfg)
+    if session is None:
+        return 1
+    for w in clips.warnings:
+        print(f"{WARN} {w}")
+    try:
+        if args.simulate:
+            if clips.mode != "director":
+                print(f"{FAIL} La simulación necesita el modo director.")
+                return 1
+            seed = cfg.video.seed if cfg.video.seed is not None else args.script_seed
+
+            def make(clock):  # noqa: ANN001, ANN202
+                return Director(
+                    cfg.video,
+                    clips.silent_pool,
+                    clips.speaking_pool,
+                    clips.gestures,
+                    gestures_cfg=cfg.gestures,
+                    clock=clock,
+                    seed=seed,
+                    speaking_actions=clips.speaking_actions,
+                )
+
+            print(f"Simulando {args.duration / 3600:.2f} h de reunión con reloj falso...")
+            res = simulate(
+                make,
+                args.duration,
+                fps=cfg.video.fps,
+                gesture_every_s=args.gesture_every,
+                seed=args.script_seed,
+                pause_every_s=args.pause_every,
+            )
+            print(res.render())
+            ok = (
+                res.gestures_stuck == 0
+                and res.discontinuities == 0
+                and res.pause_frame_changes == 0
+                and res.black_frames == 0
+            )
+            return 0 if ok else 2
+
+        print(f"Soak en tiempo real: {args.duration:.0f} s, modo {clips.mode}, sin cámara virtual.")
+
+        def progress(now: float, status) -> None:  # noqa: ANN001
+            r = status.render
+            sys.stdout.write(
+                f"\r  {now:6.0f}/{args.duration:.0f} s  {status.headline:<22} "
+                f"FPS {r.fps_effective:5.2f}  tardíos {r.late_frames:<5}"
+            )
+            sys.stdout.flush()
+
+        try:
+            res = run_soak(
+                session,
+                args.duration,
+                gesture_every_s=args.gesture_every,
+                seed=args.script_seed,
+                progress=None if args.quiet else progress,
+            )
+        except KeyboardInterrupt:
+            print("\nInterrumpido.")
+            return 1
+        print("\n")
+        print(res.render())
+        ok = res.fps_mean >= cfg.video.fps * 0.97 and not res.errors and res.degraded_events == 0
+        print(f"\n{OK if ok else FAIL} FPS sostenidos y sin errores")
+        return 0 if ok else 2
+    finally:
+        session.close()
 
 
 def cmd_gui(args: argparse.Namespace) -> int:
@@ -785,6 +1225,20 @@ def _add_clip_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--pixel-format", choices=("nv12", "bgr"), dest="pixel_format")
     p.add_argument("--force", action="store_true", help="Regenera la caché de clips.")
     p.add_argument("--ram", action="store_true", help="Carga la caché entera en RAM.")
+    p.add_argument(
+        "--playback",
+        choices=("director", "classic"),
+        help="director: grupos de clips, boca guiada por la voz y gestos; "
+        "classic: el compositor anterior (respaldo).",
+    )
+    p.add_argument("--manifest", help="Manifiesto de la biblioteca (grupos y gestos).")
+    p.add_argument("--seed", type=int, help="Semilla del director (reproducible).")
+    p.add_argument(
+        "--no-normalize",
+        action="store_true",
+        dest="no_normalize",
+        help="No igualar encuadre ni color entre clips.",
+    )
 
 
 def _add_audio_args(p: argparse.ArgumentParser) -> None:
@@ -835,6 +1289,10 @@ def build_parser() -> argparse.ArgumentParser:
             '  camvoice run --speaking hablando.mp4 --silent quieto.mp4 --save\n'
             "  camvoice vad-test --duration 30\n"
             "  camvoice bench --duration 1800 --metrics\n"
+            "  camvoice make-clips --library --outdir .\\clips\n"
+            "  camvoice library --import\n"
+            "  camvoice gestures\n"
+            "  camvoice soak --duration 7200\n"
         ),
     )
     parser.add_argument("--config", help="Ruta alternativa del archivo de configuración.")
@@ -911,13 +1369,90 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--interval", type=float, default=0.25, metavar="S")
     p.set_defaults(func=cmd_vad_test)
 
+    p = sub.add_parser(
+        "teams-test",
+        help="Muestra el estado del micrófono de Teams que lee CamVoice (solo lectura).",
+    )
+    p.add_argument("--duration", type=float, default=30.0, metavar="S")
+    p.add_argument("--interval", type=float, default=0.25, metavar="S")
+    p.set_defaults(func=cmd_teams_test)
+
     p = sub.add_parser("make-clips", help="Genera clips sintéticos de prueba.")
     p.add_argument("--outdir", default="clips")
     p.add_argument("--width", type=int, default=640)
     p.add_argument("--height", type=int, default=480)
     p.add_argument("--fps", type=int, default=30)
     p.add_argument("--seconds", type=float, default=6.0)
+    p.add_argument(
+        "--library",
+        action="store_true",
+        help="Además: segundo silencio, clips de gesto y manifest.json.",
+    )
     p.set_defaults(func=cmd_make_clips)
+
+    p = sub.add_parser("index", help="Prepara cachés e índices del modo director.")
+    _add_clip_args(p)
+    p.set_defaults(func=cmd_index)
+
+    p = sub.add_parser(
+        "transitions",
+        help="Mide coste y espera de las transiciones sobre los clips reales (sin cámara).",
+    )
+    _add_clip_args(p)
+    p.add_argument("--repeats", type=int, default=20, help="Ensayos por escenario (20).")
+    p.set_defaults(func=cmd_transitions)
+
+    p = sub.add_parser(
+        "library",
+        help="Detecta, valida e importa las grabaciones numeradas (1..66).",
+        description=(
+            "Sin opciones solo detecta. Los videos originales nunca se modifican ni se "
+            "borran; por defecto se referencian (con --copy se copian a la biblioteca)."
+        ),
+    )
+    p.add_argument("--folder", help="Carpeta de origen (por defecto Imágenes\\Camera Roll).")
+    p.add_argument("--validate", action="store_true", help="Valida cada video (reanudable).")
+    p.add_argument("--import", dest="do_import", action="store_true",
+                   help="Valida e importa al manifiesto (idempotente).")
+    p.add_argument("--copy", action="store_true", help="Copia los videos en vez de referenciarlos.")
+    p.add_argument("--keep-main", dest="keep_main", action="store_true",
+                   help="No cambiar los clips principales por los n.º 1 y 2.")
+    p.add_argument("--force", action="store_true", help="Revalidar aunque no hayan cambiado.")
+    p.add_argument("--rollback", action="store_true", help="Deshace la última importación.")
+    p.set_defaults(func=cmd_library)
+
+    p = sub.add_parser("gestures", help="Lista/valida los gestos o asigna un clip a uno.")
+    p.add_argument("--manifest", help="Manifiesto de la biblioteca.")
+    p.add_argument("--set", nargs=2, metavar=("GESTO", "CLIP"), help="Asigna un clip a un gesto.")
+    p.add_argument("--hotkey", help="Atajo del gesto asignado con --set (p. ej. Ctrl+Alt+F1).")
+    p.set_defaults(func=cmd_gestures)
+
+    p = sub.add_parser(
+        "soak", help="Prueba de resistencia con voz sintética (sin micrófono ni cámara)."
+    )
+    _add_clip_args(p)
+    p.add_argument(
+        "--duration", type=float, default=7200.0, metavar="S",
+        help="Duración (por defecto 7200 s = 2 h).",
+    )
+    p.add_argument(
+        "--gesture-every", type=float, default=45.0, metavar="S", dest="gesture_every",
+        help="Pide un gesto al azar cada S segundos (0 = nunca).",
+    )
+    p.add_argument(
+        "--script-seed", type=int, default=7, dest="script_seed",
+        help="Semilla del guion de voz sintética.",
+    )
+    p.add_argument(
+        "--simulate", action="store_true",
+        help="Solo lógica, con reloj falso: horas en minutos (no mide FPS).",
+    )
+    p.add_argument(
+        "--pause-every", type=float, default=600.0, metavar="S", dest="pause_every",
+        help="Con --simulate: pausa manual de 5 s cada S segundos (0 = nunca).",
+    )
+    p.add_argument("--quiet", action="store_true")
+    p.set_defaults(func=cmd_soak)
 
     p = sub.add_parser("config", help="Muestra o borra la configuración guardada.")
     p.add_argument("--reset", action="store_true")
